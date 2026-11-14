@@ -1,0 +1,15 @@
+node_modules
+.next
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+public/local/
+public/twin-local/
+ios/build/
+ios/*.xcodeproj
+ios/Info.plist
+ios/icon-src/
+DerivedData
