@@ -4,85 +4,80 @@
 
 <img src="assets/thumbnail.jpg" alt="Bearly" width="640">
 
-Put on Meta glasses, hold up a product and say what you want. An AI that sees what you see finds it in real shops,
-reads the price back to you, and buys it when you say yes. Then it writes the invoice and a walk report and drafts the
-email to your manager. Nothing is typed.
+Bearly is a shopping helper that lives in your smart glasses. Look at something, say what you want, and it finds it,
+buys it and writes down what happened. You never touch a screen or type a word.
 
-Built for **VexoHacks** (AI wearables, YC, 14 Nov 2026).
+It was built for VexoHacks, the AI wearables hackathon at Y Combinator, 14 Nov 2026.
 
-> **Payments are Stripe test mode only.** No real money moves and no order is placed with the shop. The payment routes
-> refuse any key that does not start with `sk_test_`.
+> Payments run in **Stripe test mode**, so no real money is ever spent.
 
-## What it does
+## What it feels like
 
-| You do | It does |
-|---|---|
-| Hold up a bag of chips: "What is this? Find me the cheapest one." | Gemini reads the label, Shopify's catalog returns real offers, the cheapest sensible one lands on screen as a card with photos. |
-| "Buy it." | A one-time Stripe Shared Payment Token, capped at that price, is created and charged in test mode (about 1.2 s). |
-| "Email my manager the invoice and the report." | An invoice and a walk report are built from the session and shown as an email draft. |
-| "The gauge reads 62 psi, write that down." | The value is saved and pinned on the photo of what you were looking at. |
-| "Show me the board." | One screen with everything seen, asked and bought, plus annotated photos. |
+> You: "What is this? Find me the cheapest one."
+> Bearly: "That's a bag of chips. The cheapest I found is on your screen. Want it?"
+> You: "Yup."
+> Bearly: "Bought it."
+> You: "Email my manager the invoice."
+> Bearly: "Done, the email is ready."
 
-While you talk, the screen shows boxes on what you look at (Jev), a stream of what you have seen, your position in a 3D room
-(phone steps + glasses head turn), and each request with the steps the agent is taking, in plain sentences.
+Along the way you can also say things like "The gauge reads 62 psi, write that down" and Bearly saves it with a photo of
+what you were looking at. Say "show me the board" to see everything from the session on one screen.
 
-## How it works
+## What you see on the screen
 
-```
-Meta glasses --Bluetooth + Wi-Fi--> iPhone app (ios/) --LiveKit--> this web page (/demo) --> Gemini Live (voice + vision + tools)
-                                     + phone steps/compass                                  --> Jev (boxes)  --> Shopify catalog --> Stripe (test)
-```
+- **Left:** what your glasses see, with a box around the things you look at.
+- **Middle:** a little bear that walks around a 3D room as you walk, and a list of things you looked at.
+- **Right:** each thing you asked for, with the steps Bearly took, written as plain sentences ("I'm searching Shopify...").
 
-- **Gemini Live** (`gemini-3.8-live`): one realtime session hears you, sees one frame per second, talks back and calls tools:
-  `find_product`, `select_offer`, `next_offer`, `buy_selected`, `skip_offer`, `email_manager`, `show_document`, `add_note`, `record_reading`.
-  A short-lived token is minted server side, so the key never reaches the browser.
-- **Jev** (TypeSafe System One): draws boxes on what is in view. Jev picks from categories and cannot read a brand, so Gemini names
-  the product and Jev then follows that exact thing.
-- **Shopify Global Catalog**: real products and prices (no key needed).
-- **Stripe**: Shared Payment Tokens in a sandbox; falls back to a test-card PaymentIntent if the preview is not enabled.
-- **ElevenLabs**: speech to text for the older Mic button, and a spoken-reply route.
-- **LiveKit**: carries the glasses camera and microphone from the phone to the page.
-- **Meta Wearables Device Access Toolkit** (DAT 1.0.1): the glasses camera and motion sensor, in the iOS app.
-- An **echo gate** keeps the assistant from hearing itself on a loudspeaker; a **noise gate** keeps a crowded room from
-  swallowing your voice. Space bar or a tap on the picture cuts the assistant off.
+## What you need
 
-## Run it
+- Meta smart glasses (Ray-Ban Meta or Oakley Meta) with Developer Mode turned on
+- An iPhone
+- A laptop (this is the screen the audience watches)
+- A few free accounts for the keys listed in `.env.example`
 
-Web (Node 20+):
+## Try it
+
+**1. Start the screen on your laptop**
 
 ```bash
 npm install
-cp .env.example .env.local   # fill in the keys
-npm run dev                  # http://localhost:3127/demo
+cp .env.example .env.local     # then paste your keys into .env.local
+npm run dev
 ```
 
-Open `/demo`. It shows this computer's camera right away and switches to the glasses when they start sending.
-Press **Talk live** and speak.
+Open http://localhost:3127/demo. It shows your laptop camera right away. Press **Talk live** and start talking.
 
-Phone app (iOS 17.2+, a real iPhone, Meta glasses with Developer Mode on):
+**2. Connect your glasses (optional, but it is the point)**
 
 ```bash
 brew install xcodegen
-cd ios && DEVELOPMENT_TEAM=<your Apple team id> xcodegen generate && open Bearly.xcodeproj
+cd ios
+DEVELOPMENT_TEAM=<your Apple team id> xcodegen generate
+open Bearly.xcodeproj
 ```
 
-1. Meta AI app > Settings > App Info > tap the version 5 times to enable Developer Mode, then push the settings to the glasses.
-2. Run **Bearly**, tap **Register with Meta AI**, then **Send to stage** with the stage computer's address in the field.
-3. Close any other app that holds the glasses camera. Only one app can have it.
+Run the app on your iPhone. In the Meta AI app, turn on Developer Mode (Settings, App Info, tap the version number 5 times).
+In Bearly, tap **Register with Meta AI**, then **Send to stage**. Your glasses view replaces the laptop camera.
 
-## Honest limits
+If the glasses will not connect, close any other app that is using them. Only one app can use the glasses at a time.
 
-- Position is counted steps plus compass, so it drifts after a few minutes. Use **Place me** to line the rebuilt room up again.
-- "Cheapest" is filtered for obviously wrong prices, but a shop's title may not be the exact same product. The assistant says when it is a close match.
-- The manager email is drafted on screen; sending it is not connected.
-- Meta's glasses motion API is beta; the microphone reaches the phone as Bluetooth call audio, so it is lower quality than a phone mic.
-- Optional room assets (`public/twin-local/world.spz`, `bear.png`, `recon-yc.json`) are local only and not in this repo.
+## How it works, in plain words
 
-## Layout
+1. The glasses send what they see and hear to your iPhone, and the phone sends it to the laptop.
+2. **Gemini Live** listens, looks, talks back and decides what to do.
+3. **Jev** draws the boxes around things in the picture.
+4. Bearly searches real shops through the **Shopify catalog** and shows you the cheapest good match.
+5. When you say yes, **Stripe** pays for it.
+6. **LiveKit** carries the video and sound from the phone to the laptop.
+7. **ElevenLabs** handles speech to text for the backup microphone button.
+
+## Where things are
 
 ```
-app/demo            the stage page
-app/api/twin/*      server routes: live-token, livekit-token, see (Jev), shop, pay, hear, speak, intent, depth, log
-components/twin     report-app.tsx (the page), pin-room.tsx (3D view)
-ios/                Bearly app: glasses camera + mic + sensors into a LiveKit room
+app/demo           the screen
+app/api/twin       the small server pieces: search, pay, listen, speak
+components/twin    the screen's code and the 3D room
+ios                the iPhone app
+assets             the bear
 ```
