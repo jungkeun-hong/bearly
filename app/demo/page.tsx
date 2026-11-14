@@ -5,7 +5,7 @@ import ReportApp from "@/components/twin/report-app"
 // the picture is the glasses when they are sending, otherwise this computer's camera. No recorded footage.
 
 export const metadata: Metadata = {
-  title: { absolute: "Bearly | Too lazy to shop? Just say yup." },
+  title: { absolute: "Bearly | Too lazy to shop? Say Hey Bearly." },
   robots: { index: false, follow: false },
 }
 

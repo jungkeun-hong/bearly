@@ -1,11 +1,13 @@
 # Bearly
 
-**Too lazy to shop? Just say yup.**
+**Too lazy to shop? Say "Hey Bearly."**
 
 <img src="assets/thumbnail.jpg" alt="Bearly" width="640">
 
 Bearly is a shopping helper that lives in your smart glasses. Look at something, say what you want, and it finds it,
 buys it and writes down what happened. You never touch a screen or type a word.
+
+The name is a pun. You *barely* lift a finger, and the helper is a bear.
 
 It was built for VexoHacks, the AI wearables hackathon at Y Combinator, 14 Nov 2026.
 
@@ -13,7 +15,7 @@ It was built for VexoHacks, the AI wearables hackathon at Y Combinator, 14 Nov 2
 
 ## What it feels like
 
-> You: "What is this? Find me the cheapest one."
+> You: "Hey Bearly, what is this? Find me the cheapest one."
 > Bearly: "That's a bag of chips. The cheapest I found is on your screen. Want it?"
 > You: "Yup."
 > Bearly: "Bought it."

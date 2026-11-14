@@ -18,7 +18,7 @@ const full = await sharp("assets/source/bear-full.png").resize({ height: 960 }).
 const w = (await sharp(full).metadata()).width
 const text = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1000">
   <text x="90" y="470" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="800" font-size="190" fill="${CREAM}">Bearly</text>
-  <text x="96" y="560" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="500" font-size="46" fill="${STEEL}">Too lazy to shop? Just say yup.</text>
+  <text x="96" y="560" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="500" font-size="40" fill="${STEEL}">Too lazy to shop? Say &quot;Hey Bearly.&quot;</text>
 </svg>`)
 await sharp({ create: { width: 1500, height: 1000, channels: 3, background: INK } })
   .composite([{ input: full, left: 1500 - w - 90, top: 30 }, { input: text, left: 0, top: 0 }]).jpeg({ quality: 92 }).toFile("assets/thumbnail.jpg")
