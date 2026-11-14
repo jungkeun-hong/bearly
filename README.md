@@ -66,6 +66,8 @@ If the glasses will not connect, close any other app that is using them. Only on
 
 ## How it works, in plain words
 
+<img src="assets/architecture.png" alt="Bearly architecture: input, stage, agent, tools, output" width="900">
+
 1. The glasses send what they see and hear to your iPhone, and the phone sends it to the laptop.
 2. **Gemini Live** listens, looks, talks back and decides what to do.
 3. **Jev** draws the boxes around things in the picture.
