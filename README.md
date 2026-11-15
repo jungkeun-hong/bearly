@@ -2,6 +2,8 @@
 
 **A hands-free AI agent with eyes and ears. More deals, first visit.**
 
+<img src="assets/cover.jpg" alt="Bearly" width="640">
+
 <img src="assets/architecture.png" alt="Bearly architecture: input, stage, agent, tools, output" width="900">
 
 ## The problem
