@@ -625,6 +625,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   const toggleBandRef = useRef<(silent?: boolean) => Promise<void>>(async () => {})
   const bandLoop = useRef(false)
   const bandFails = useRef(0)
+  const bandManual = useRef(false), bandBusy = useRef(false)
   const bandNeverPicked = useRef(false) // Chrome has no remembered band yet: only then is the one-time chooser needed
   const bandTapRef = useRef(bandTap)
   useEffect(() => { bandTapRef.current = bandTap })
@@ -638,7 +639,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   }
   // The band connected to the iPhone: its Opus packets arrive over LiveKit and are decoded here, exactly like the band
   // on the Mac's own Bluetooth, into the same stream the live session reads.
-  const phoneBand = useRef<{ sound: { push: (a: any) => void; close: () => void }; ctx: AudioContext } | null>(null)
+  const phoneBand = useRef<{ sound: { push: (a: unknown) => void; close: () => void }; ctx: AudioContext } | null>(null)
   const phoneBandStarting = useRef(false)
   const phoneBandAudio = async (payload: Uint8Array) => {
     if (payload.length < 3) return
@@ -677,15 +678,20 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   /** silent: only reconnect a band this site already picked once (no chooser, works without a click, e.g. on page load). */
   const toggleBand = async (silent = false) => {
     if (bandRef.current) { if (!silent) await dropBand(); return }
-    if (bandUi === "connecting") return
-    setBandUi("connecting"); if (!silent) setMic("band: double-tap band 67, then pick Vexo-HACK-67")
+    // A click always wins: it stops the quiet retries and opens the chooser even if a quiet attempt is still running.
+    if (!silent) bandManual.current = true
+    else if (bandManual.current || bandBusy.current) return
+    bandBusy.current = silent
+    if (!silent) setBandUi("connecting"); if (!silent) setMic("band: double-tap band 67, then pick Vexo-HACK-67")
     try {
       const { Band, BandAudio, canDecodeAudio } = await import("@/components/vexo/index.js")
       if (!(await canDecodeAudio())) throw new Error("this browser cannot decode the band's sound, use Chrome")
       const { WebBluetoothTransport } = await import("@/components/vexo/transports/web-bluetooth.js")
       const transport = new WebBluetoothTransport(67) as InstanceType<typeof WebBluetoothTransport> & { silent?: boolean }
       transport.silent = silent
-      const band = await Band.connect(67, { autoReconnect: true, transport })
+      const band = await Band.connect(67, { autoReconnect: true, transport, timeoutMs: 5000 })
+      if (silent) bandBusy.current = false
+      if (bandRef.current) { try { await band.disconnect() } catch { /* fine */ } return } // the other attempt got there first
       // The band's 20 ms pieces of sound are played, in order, into a silent audio stream that the live session reads.
       const ctx = new AudioContext({ sampleRate: 16000 })
       const dest = ctx.createMediaStreamDestination()
@@ -699,7 +705,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         src.start(at); at += buf.duration
       })
       bandRef.current = { band, sound, ctx }
-      band.on("audio", (a: unknown) => sound.push(a as { seq: any; opus: any }))
+      band.on("audio", (a: unknown) => sound.push(a))
       band.on("tap", () => bandTapRef.current("tap"))
       band.on("double-tap", () => bandTapRef.current("double-tap"))
       band.on("reconnecting", () => setMic("band: link dropped, reconnecting…"))
@@ -712,6 +718,8 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       if (!liveSession.current) setMic("band 67: connected, microphone on. Talk live uses it.")
     } catch (e) {
       const b = bandRef.current
+      if (silent) bandBusy.current = false; else bandManual.current = false
+      if (silent && bandRef.current) return // a click connected it meanwhile
       bandRef.current = null; bandStream.current = null; setBandUi("off")
       try { await b?.band.disconnect() } catch { /* already gone */ }
       if (!silent) setMic(`band: ${e instanceof Error ? e.message : String(e)}`)
@@ -752,7 +760,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       const model: string = useFallback ? tk.fallbackModel : tk.model
       let playAt = 0, closed = false, newIn = true, newOut = true, turnIn = "", turnOut = ""
       let dropTurn = false // after a manual cut-in, the rest of what it was saying is thrown away
-      let saidSound = false, dg: WebSocket | null = null, dgNew = false, sendFrame = () => {}, voiceAt = 0, heardAt = 0, toolAt = 0, chime: OscillatorNode | null = null // for timing a turn and the waiting sound
+      let lastClock = 0, stalled = 0, saidSound = false, dg: WebSocket | null = null, dgNew = false, sendFrame = () => {}, voiceAt = 0, heardAt = 0, toolAt = 0, chime: OscillatorNode | null = null // for timing a turn and the waiting sound
       // A soft tone while a tool runs, so a pause never sounds like the assistant died. Stops at its first word.
       const chimeOff = () => { try { chime?.stop() } catch { /* already stopped */ } chime = null }
       const chimeOn = () => {
@@ -767,6 +775,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       const hush = () => { playing.forEach((x) => { try { x.stop() } catch { /* already stopped */ } }); playing.clear(); playAt = 0 }
       const play = (b64: string) => {
         if (out.state !== "running") void out.resume().catch(() => {}) // a paused output plays nothing and never ends
+        if (playAt - out.currentTime > 15) { stageLog(`voice backlog ${(playAt - out.currentTime).toFixed(0)} s (speaker ${out.state}): dropped so the mic opens again`); hush() }
         const bin = atob(b64), n = bin.length >> 1
         if (!n) return
         const buf = out.createBuffer(1, n, 24000), ch = buf.getChannelData(0)
@@ -886,6 +895,10 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         // Sound that was queued but never played keeps the echo gate shut ("not listening while I talk") forever. If the
         // queue is stuck for more than 4 s past its end, drop it so the mic opens again, and say what the speaker is doing.
         if (playing.size && out.currentTime > playAt + 4) { playing.clear(); playAt = 0 }
+        if (playing.size && out.currentTime - lastClock < 0.3) {
+          if (++stalled >= 2) { stageLog(`speaker stalled (state ${out.state}, clock ${out.currentTime.toFixed(1)}): restarting it`); hush(); stalled = 0; void out.suspend().then(() => out.resume()).catch(() => {}) }
+        } else stalled = 0
+        lastClock = out.currentTime
         if (out.state !== "running" || micCtx?.state === "suspended") setMicLevel(`speaker ${out.state}: click this page once so Bearly can talk and listen`)
         else if (micStream) { setMicLevel(micPeak === -2 ? "hold Space and talk" : micPeak < 0 ? `not listening while I talk (${Math.max(0, playAt - out.currentTime).toFixed(1)} s of voice left)` : micPeak >= 1 ? "hearing you" : micPeak > 0 ? "room noise only, speak up or closer" : "silent"); micPeak = 0 }
       }, 1000)
@@ -1075,7 +1088,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
               void (async () => {
                 for (let i = 0; i < 20 && stageOn.current && !bandRef.current; i++) {
                   await toggleBandRef.current(true)
-                  if (bandRef.current || bandNeverPicked.current) break
+                  if (bandRef.current || bandNeverPicked.current || bandManual.current) break
                   await sleep(1000)
                 }
                 bandLoop.current = false
@@ -1257,7 +1270,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
               ))}
             </span>
           )}
-          {demo && phoneOn && bandUi === "off" && bandFirstTime && <button onClick={() => void toggleBand()} className={`${chip} !border-[#F4F4F2] !text-[#F4F4F2]`}>Connect band</button>}
+          {demo && phoneOn && bandUi !== "on" && bandFirstTime && <button onClick={() => void toggleBand()} className={`${chip} !border-[#F4F4F2] !text-[#F4F4F2]`}>Connect band</button>}
           <button onClick={() => setZoom("board")} className={chip}>Board</button>
           {demo && spatial && <button onClick={() => setMapOpen(true)} className={chip}>Map</button>}
           {demo ? (
