@@ -1,6 +1,5 @@
 import Foundation
 import CoreMotion
-import MWDATMotion
 import simd
 
 /// Where the wearer is and which way their body faces, from this phone in a pocket. No camera, no GPS:
@@ -12,7 +11,10 @@ final class PhoneTracker {
   private(set) var x = 0.0, z = 0.0, steps = 0
   private(set) var heading = 0.0 // radians, clockwise, 0 = the way the body faced at Recenter
   private var rawHeading = 0.0, heading0: Double?
-  private var bounce = 0.0, armed = true, lastStep = 0.0
+  private var bounce = 0.0, wasBelow = false, low = 0.0, high = 0.0, lastStep = 0.0
+  private let pedometer = CMPedometer()
+  private var counted = 0 // steps the system pedometer has reported since Recenter (arrives late, in batches)
+  private var pedometerBase: Int?
   var stepLength = 0.7
 
   var available: Bool { motion.isDeviceMotionAvailable }
@@ -24,9 +26,26 @@ final class PhoneTracker {
       guard let m else { return }
       Task { @MainActor in self?.update(m) }
     }
+    // Safety net: the system's own step counter. It is seconds late, so it never drives the position directly;
+    // it only adds the steps the fast detector below missed.
+    if CMPedometer.isStepCountingAvailable() {
+      pedometer.startUpdates(from: Date()) { [weak self] data, _ in
+        guard let n = data?.numberOfSteps.intValue else { return }
+        Task { @MainActor in self?.catchUp(n) }
+      }
+    }
   }
 
-  func recenter() { x = 0; z = 0; steps = 0; heading0 = rawHeading; heading = 0 }
+  func recenter() { x = 0; z = 0; steps = 0; heading0 = rawHeading; heading = 0; pedometerBase = nil; counted = 0 }
+
+  private func step() { steps += 1; x += sin(heading) * stepLength; z -= cos(heading) * stepLength }
+
+  private func catchUp(_ total: Int) {
+    if pedometerBase == nil { pedometerBase = total - steps } // line the two counters up at the first report
+    counted = total - (pedometerBase ?? 0)
+    var missing = counted - steps
+    while missing > 0 { step(); missing -= 1 }
+  }
 
   private func update(_ m: CMDeviceMotion) {
     // Which way the phone points along the floor. In a pocket the phone stands upright, so use the direction its back faces;
@@ -38,39 +57,20 @@ final class PhoneTracker {
     if heading0 == nil { heading0 = rawHeading }
     heading = rawHeading - (heading0 ?? 0)
 
-    // A step: the up-and-down push of walking, taken along gravity so the phone's orientation does not matter.
+    // A step, the moment it happens: the body bounces once per step. Take the bounce along gravity (so the phone's
+    // orientation does not matter), smooth it, and count one step each time it swings up through zero after a swing
+    // of at least 0.07 g. This catches a soft walk with the phone in a pocket or in the hand.
     let a = m.userAcceleration, g = m.gravity
     let vertical = -(a.x * g.x + a.y * g.y + a.z * g.z) // in g, positive = pushed upward
-    bounce = bounce * 0.8 + vertical * 0.2
+    bounce = bounce * 0.75 + vertical * 0.25
+    low = min(low, bounce); high = max(high, bounce)
     let now = m.timestamp
-    if armed, bounce > 0.11, now - lastStep > 0.33 {
-      armed = false; lastStep = now; steps += 1
-      x += sin(heading) * stepLength; z -= cos(heading) * stepLength
-    } else if bounce < 0.02 { armed = true }
-  }
-}
-
-/// How far the head is turned, from the glasses' motion sensor (Meta DAT Motion, a beta capability).
-/// Ray-Ban Meta gives no compass, so this integrates the turn rate around the direction of gravity. It drifts slowly.
-@MainActor
-final class HeadTracker {
-  private(set) var yaw = 0.0 // radians, clockwise, 0 = where the head faced at Recenter
-  private(set) var samples = 0
-  private var gravity = SIMD3<Float>(0, 0, 0)
-  private var lastNs: Int64 = 0
-  var flipped = false // if the cone turns the wrong way on screen
-
-  func recenter() { yaw = 0 }
-
-  func feed(_ s: MotionSample) {
-    samples += 1
-    if let a = s.accelerometer { gravity = gravity == .zero ? a.simd : gravity * 0.95 + a.simd * 0.05 } // at rest this points up
-    defer { lastNs = s.timestampNs }
-    guard let w = s.gyroscope, lastNs != 0, simd_length(gravity) > 1 else { return }
-    let dt = Double(s.timestampNs - lastNs) / 1e9
-    guard dt > 0, dt < 0.5 else { return }
-    let up = simd_normalize(gravity)
-    let turn = Double(simd_dot(w.simd, up)) // rad/s, counter-clockwise seen from above
-    yaw += (flipped ? turn : -turn) * dt
+    if bounce < 0 { wasBelow = true }
+    else if wasBelow {
+      wasBelow = false
+      let swing = high - low, gap = now - lastStep
+      if swing > 0.07, gap > 0.28 { lastStep = now; step() }
+      low = 0; high = 0
+    }
   }
 }

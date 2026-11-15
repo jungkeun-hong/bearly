@@ -3,6 +3,16 @@ import UIKit
 import AVFoundation
 import LiveKit
 
+/// Hands each glasses frame to LiveKit on the glasses' own thread: no hop to the main thread and no
+/// image redraw on the way, which is what made the picture lag before.
+final class FrameSink: @unchecked Sendable {
+  static let shared = FrameSink()
+  private let lock = NSLock()
+  private var capturer: BufferCapturer?
+  func set(_ c: BufferCapturer?) { lock.lock(); capturer = c; lock.unlock() }
+  func push(_ sample: CMSampleBuffer) { lock.lock(); let c = capturer; lock.unlock(); c?.capture(sample) }
+}
+
 /// The LiveKit room: publishes the glasses frames as a video track and the microphone as an audio track.
 @MainActor
 final class Publisher {
@@ -16,7 +26,7 @@ final class Publisher {
   private(set) var connected = false
 
   /// Gets a publish-only token from the stage Mac and joins the room with the microphone on.
-  func connect(stage: String) async {
+  func connect(stage: String, glassesMic: Bool = false) async {
     do {
       // Ask the stage Mac for a fresh pass. If the Mac cannot be reached (another network, cellular), reuse the last one:
       // it is good for twelve hours, so once fetched the phone can reconnect from anywhere with internet.
@@ -33,34 +43,39 @@ final class Publisher {
       }
       if !fresh { onStatus?("stage Mac not reachable, using the saved pass") }
 
+      // NO microphone and NO Bluetooth call audio on this phone. The glasses are also this phone's Bluetooth headset, and
+      // LiveKit's default audio setup (play-and-record with hands-free allowed) opens a hands-free (HFP) link to them as
+      // soon as a mic is published. Meta (meta-wearables-dat-ios#342): while that link is up the glasses refuse every new
+      // session with "Device unavailable" and end running ones. The wearer's voice comes from the Vexo band instead.
+      AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
+      try? AVAudioSession.sharedInstance().setCategory(.ambient, mode: .default, options: [])
       try await room.connect(url: server, token: token)
       connected = true
-      // Audio session after connecting: changing it earlier stalled WebRTC in an earlier app.
-      routeMicToGlasses()
-      try await room.localParticipant.setMicrophone(enabled: true)
-
       let track = await LocalVideoTrack.createBufferTrack(name: "glasses-camera", source: .camera)
       self.track = track
       capturer = track.capturer as? BufferCapturer
-      onStatus?("in room \(answer.room ?? "?") · mic on · waiting for camera frames")
+      FrameSink.shared.set(capturer)
+      onStatus?("in room \(answer.room ?? "?") · no phone mic · audio route: \(Self.routeText())")
     } catch {
       onStatus?("room failed: \(error.localizedDescription)")
     }
   }
 
-  /// Push one glasses frame. The video track is published once the first frame has gone in,
-  /// because LiveKit reads the video size from it.
-  func push(_ image: UIImage) {
-    guard connected, let capturer, let cg = image.cgImage,
-          let buffer = Self.pixelBuffer(from: cg) else { return }
-    capturer.capture(buffer)
+  /// Called after frames have gone into the capturer (FrameSink, straight from the glasses thread).
+  /// The video track is published once the first frame has gone in, because LiveKit reads the video size from it.
+  func framesFlowing() {
+    guard connected else { return }
+    if let capturer { FrameSink.shared.set(capturer) }
     if !published, !publishing, let track {
       publishing = true
       Task {
         do {
-          try await room.localParticipant.publish(videoTrack: track, options: VideoPublishOptions(encoding: VideoEncoding(maxBitrate: 3_000_000, maxFps: 24)))
+          // One full-quality layer (no simulcast), so the Mac never gets a small backup copy, and keep the
+          // resolution sharp when bandwidth dips (drop frames instead), because the AI reads labels from it.
+          try await room.localParticipant.publish(videoTrack: track, options: VideoPublishOptions(
+            encoding: VideoEncoding(maxBitrate: 2_500_000, maxFps: 15), simulcast: false, degradationPreference: .maintainResolution))
           published = true
-          onStatus?("live · camera and mic are in the room")
+          onStatus?("live · camera is in the room")
         } catch {
           onStatus?("could not publish video: \(error.localizedDescription)")
         }
@@ -75,35 +90,23 @@ final class Publisher {
     Task { try? await room.localParticipant.publish(data: data, options: DataPublishOptions(reliable: false)) }
   }
 
+  /// Raw bytes to everyone in the room. `topic` nil = no topic (like send()). Reliable for events, lossy for audio.
+  func sendBinary(_ data: Data, topic: String?, reliable: Bool) {
+    guard connected else { return }
+    Task { try? await room.localParticipant.publish(data: data, options: DataPublishOptions(topic: topic, reliable: reliable)) }
+  }
+
   func disconnect() async {
+    FrameSink.shared.set(nil)
     await room.disconnect()
     connected = false; published = false; track = nil; capturer = nil
   }
 
-  /// The glasses microphone is the phone's Bluetooth hands-free input. Prefer it when it is there.
-  private func routeMicToGlasses() {
-    let audio = AVAudioSession.sharedInstance()
-    try? audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .allowBluetoothA2DP])
-    try? audio.setActive(true)
-    if let input = audio.availableInputs?.first(where: { let n = $0.portName.lowercased(); return n.contains("meta") || n.contains("ray-ban") || n.contains("oakley") }) {
-      try? audio.setPreferredInput(input)
-    }
-  }
-
-  /// BGRA pixel buffer at the image's own size, capped at 1280 on the long side.
-  private static func pixelBuffer(from image: CGImage) -> CVPixelBuffer? {
-    let scale = min(1, 1280 / CGFloat(max(image.width, image.height)))
-    let width = Int(CGFloat(image.width) * scale) / 2 * 2, height = Int(CGFloat(image.height) * scale) / 2 * 2
-    var out: CVPixelBuffer?
-    let attrs: [CFString: Any] = [kCVPixelBufferCGImageCompatibilityKey: true, kCVPixelBufferCGBitmapContextCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
-    guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &out) == kCVReturnSuccess, let buffer = out else { return nil }
-    CVPixelBufferLockBaseAddress(buffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-    guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height, bitsPerComponent: 8,
-                                  bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
-    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-    return buffer
+  /// What iOS is using for sound right now. "BluetoothHFP" here means a call-audio link to the glasses is up.
+  static func routeText() -> String {
+    let r = AVAudioSession.sharedInstance().currentRoute
+    let name = { (p: AVAudioSessionPortDescription) in "\(p.portType.rawValue)" }
+    return "in [\(r.inputs.map(name).joined(separator: ","))] out [\(r.outputs.map(name).joined(separator: ","))]"
   }
 
   private func fetchPass(stage: String) async -> TokenAnswer? {

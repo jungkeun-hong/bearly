@@ -27,8 +27,6 @@ targets:
         product: MWDATCore
       - package: MetaWearablesDAT
         product: MWDATCamera
-      - package: MetaWearablesDAT
-        product: MWDATMotion
       - package: LiveKit
         product: LiveKit
     settings:
