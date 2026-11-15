@@ -15,9 +15,9 @@ export async function GET() {
     })
     return Response.json({
       token: token.name,
-      model: process.env.VB_LIVE_MODEL || "gemini-3.8-live",
+      model: process.env.VB_LIVE_MODEL || "gemini-3.1-flash-live-preview",
       // Used if the first model will not connect or drops.
-      fallbackModel: process.env.VB_LIVE_FALLBACK_MODEL || "gemini-3.1-flash-live-preview",
+      fallbackModel: process.env.VB_LIVE_FALLBACK_MODEL || "gemini-3.8-live",
       voice: process.env.VB_LIVE_VOICE || "Leda",
     })
   } catch (error) {

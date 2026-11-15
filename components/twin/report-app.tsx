@@ -819,7 +819,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
             if (sc?.outputTranscription?.text) { if (newOut) { turnOut = ""; newOut = false }; turnOut += sc.outputTranscription.text; setReply(turnOut.trim()) }
             for (const part of sc?.modelTurn?.parts ?? []) if (part.inlineData?.data && !dropTurn) {
               chimeOff()
-              if (newOut || !saidSound) { saidSound = true; stageLog(`AI voice arriving, speaker: ${out.state}`) }
+              if (newOut || !saidSound) { saidSound = true; stageLog(`AI voice arriving, speaker: ${out.state}, model ${model}, format ${part.inlineData.mimeType ?? "?"}`) }
               if (heardAt) { const ms = Math.round(performance.now() - heardAt); console.log(`[vb] turn: ${ms} ms from last heard word to first sound${toolAt ? `, tool took ${toolAt} ms` : ""}`); setMic(`live · ${model} · answered in ${secs(ms)}`); heardAt = 0; toolAt = 0 }
               play(part.inlineData.data)
             }
@@ -842,7 +842,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
           },
           onerror: (e) => { setMic(`live error: ${e.message || "connection problem"}`) },
           // A dropped session comes straight back, once, on the fallback model. What was asked and bought stays on screen.
-          onclose: (e) => { if (!closed) { close(); if (!useFallback) { setMic(`live dropped${e.reason ? ` (${e.reason})` : ""}, reconnecting…`); void toggleLive(true) } else setMic(`live closed${e.reason ? `: ${e.reason}` : ""}`) } },
+          onclose: (e) => { if (!closed) { stageLog(`live session on ${model} closed by the server: ${e.reason || "no reason given"}`); close(); if (!useFallback) { setMic(`live dropped${e.reason ? ` (${e.reason})` : ""}, reconnecting…`); void toggleLive(true) } else setMic(`live closed${e.reason ? `: ${e.reason}` : ""}`) } },
         },
       })
       // Subtitles: Deepgram, pinned to English, transcribes the same sound Gemini hears. Gemini's own transcript cannot be
