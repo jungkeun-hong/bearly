@@ -12,7 +12,7 @@ const b64 = (v: string | Buffer) => Buffer.from(v).toString("base64url")
 export async function GET(req: Request) {
   const url = process.env.LIVEKIT_URL, key = process.env.LIVEKIT_API_KEY, secret = process.env.LIVEKIT_API_SECRET
   if (!url || !key || !secret) return Response.json({ error: "LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET are not all set" }, { status: 500 })
-  const room = (new URL(req.url).searchParams.get("room") || process.env.VB_LIVEKIT_ROOM || "bearly").replace(/[^\w-]/g, "").slice(0, 64)
+  const room = (new URL(req.url).searchParams.get("room") || process.env.VB_LIVEKIT_ROOM || "vibebuying").replace(/[^\w-]/g, "").slice(0, 64)
   const now = Math.floor(Date.now() / 1000)
   const publisher = new URL(req.url).searchParams.get("role") === "glasses"
   const identity = publisher ? "glasses" : `stage-${now.toString(36)}`

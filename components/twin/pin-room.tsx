@@ -146,7 +146,23 @@ function Rig({ target }: { target: [number, number] }) {
 /** A World Labs Marble world of the room (Gaussian splat, .spz), drawn with Spark. It looks like the room, but Marble
  *  fills in what the video did not show, and its size is arbitrary until it is scaled by hand. */
 const WORLD = "/twin-local/world.spz"
-function Splat({ onFail, onReady, flip }: { onFail: () => void; onReady: () => void; flip: boolean }) {
+/** Height of the floor in a splat world: the biggest flat layer in the lower half of it. Returned for both ways up. */
+function findFloors(world: SplatMesh): [number, number] {
+  const ys: number[] = []
+  let i = 0
+  world.forEachSplat((_index, center, _scales, _quaternion, opacity) => { if (i++ % 7 === 0 && opacity > 0.4) ys.push(center.y) })
+  const floorOf = (v: number[]) => {
+    if (v.length < 200) return 0
+    const sorted = [...v].sort((a, b) => a - b)
+    const lo = sorted[Math.floor(sorted.length * 0.01)], mid = sorted[Math.floor(sorted.length * 0.5)]
+    const bins = new Array(Math.max(1, Math.ceil((mid - lo) / 0.05))).fill(0)
+    for (const y of sorted) { if (y > mid) break; if (y >= lo) bins[Math.min(bins.length - 1, Math.floor((y - lo) / 0.05))]++ }
+    return lo + (bins.indexOf(Math.max(...bins)) + 0.5) * 0.05
+  }
+  return [floorOf(ys), floorOf(ys.map((y) => -y))]
+}
+
+function Splat({ onFail, onReady, flip }: { onFail: () => void; onReady: (floors: [number, number]) => void; flip: boolean }) {
   const { gl, scene } = useThree()
   const group = useRef<THREE.Group>(null)
   const mesh = useRef<SplatMesh | null>(null)
@@ -159,7 +175,7 @@ function Splat({ onFail, onReady, flip }: { onFail: () => void; onReady: () => v
     world.quaternion.set(flip ? 1 : 0, 0, 0, flip ? 0 : 1)
     mesh.current = world
     group.current?.add(world)
-    world.initialized.then(onReady).catch(onFail)
+    world.initialized.then(() => { let floors: [number, number] = [0, 0]; try { floors = findFloors(world) } catch { /* keep 0 */ } onReady(floors) }).catch(onFail)
     return () => { mesh.current = null; world.removeFromParent(); scene.remove(spark); world.dispose() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gl, scene, onFail])
@@ -235,57 +251,107 @@ function ReconScene({ recon, pins, time }: { recon: Recon; pins: Pin[]; time: nu
   )
 }
 
-/** A small bear wearing glasses, made of plain shapes. It faces -z. About 1.35 m tall, so it reads at room scale. */
-function Bear() {
-  const FUR = "#C8915A", DARK = "#8A5A30", CREAM = "#F1DFC2", EYE = "#16110C"
+/** "VEXO" in white on black, drawn once, for the front of the bear's cap. */
+function capLabel(): THREE.CanvasTexture {
+  const c = document.createElement("canvas")
+  c.width = 256; c.height = 96
+  const g = c.getContext("2d")!
+  g.fillStyle = "#101012"; g.fillRect(0, 0, 256, 96)
+  g.fillStyle = "#FFFFFF"; g.font = "900 64px Arial, Helvetica, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle"
+  g.fillText("VEXO", 128, 52)
+  const t = new THREE.CanvasTexture(c)
+  t.colorSpace = THREE.SRGBColorSpace
+  return t
+}
+
+/**
+ * The wearer as a real 3D bear: black VEXO cap, black wristband on the left wrist. About 1.4 m tall, faces -z.
+ * It turns smoothly to the way the body is heading, swings arms and legs in step with how fast it is moving,
+ * and turns its head with the glasses. All plain shapes with soft lighting, so it needs no model file.
+ */
+function Bear3D({ track, body }: { track: Track; body: React.RefObject<THREE.Group | null> }) {
+  const root = useRef<THREE.Group>(null), head = useRef<THREE.Group>(null), torso = useRef<THREE.Group>(null)
+  const armL = useRef<THREE.Group>(null), armR = useRef<THREE.Group>(null), legL = useRef<THREE.Group>(null), legR = useRef<THREE.Group>(null)
+  const last = useMemo(() => new THREE.Vector3(), [])
+  const walk = useRef({ phase: 0, amount: 0, yaw: 0, started: false })
+  const label = useMemo(() => capLabel(), [])
+  const FUR = "#B8743A", DARK = "#8A5226", CREAM = "#F0DCB8", INKY = "#141416"
+  useFrame((state, dt) => {
+    const w = walk.current, at = body.current?.position
+    if (!at || !root.current) return
+    if (!w.started) { last.copy(at); w.yaw = -track.heading; w.started = true }
+    const speed = at.distanceTo(last) / Math.max(dt, 0.001) // metres a second, after the smoothing the body already has
+    last.copy(at)
+    const target = Math.min(1, speed / 0.5)
+    w.amount += (target - w.amount) * Math.min(1, dt * 6) // ease in and out of the walk, so it never snaps
+    w.phase += dt * (5 + 5 * w.amount) * (w.amount > 0.02 ? 1 : 0)
+    // turn the short way round toward the heading
+    let d = -track.heading - w.yaw
+    d = Math.atan2(Math.sin(d), Math.cos(d))
+    w.yaw += d * Math.min(1, dt * 5)
+    root.current.rotation.y = w.yaw
+    const swing = Math.sin(w.phase) * 0.75 * w.amount, t = state.clock.elapsedTime
+    if (legL.current) legL.current.rotation.x = swing
+    if (legR.current) legR.current.rotation.x = -swing
+    if (armL.current) armL.current.rotation.x = -swing * 0.8
+    if (armR.current) armR.current.rotation.x = swing * 0.8
+    root.current.position.y = Math.abs(Math.sin(w.phase)) * 0.05 * w.amount
+    if (torso.current) { torso.current.rotation.z = Math.sin(w.phase) * 0.06 * w.amount; torso.current.scale.y = 1 + Math.sin(t * 2) * 0.012 * (1 - w.amount) } // sway while walking, breathe while standing
+    if (head.current) {
+      const turn = THREE.MathUtils.clamp(-track.head.yaw, -1.1, 1.1) // the glasses turn the head, not the body
+      head.current.rotation.y += (turn - head.current.rotation.y) * Math.min(1, dt * 8)
+      head.current.rotation.x = THREE.MathUtils.clamp(-track.head.pitch, -0.5, 0.5) + Math.sin(t * 1.3) * 0.02
+    }
+  })
+  const fur = <meshStandardMaterial color={FUR} roughness={0.95} />
   const ball = (key: string, at: [number, number, number], r: number, color: string, scale: [number, number, number] = [1, 1, 1]) => (
-    <mesh key={key} position={at} scale={scale}><sphereGeometry args={[r, 20, 16]} /><meshBasicMaterial color={color} /></mesh>
+    <mesh key={key} position={at} scale={scale}><sphereGeometry args={[r, 24, 18]} /><meshStandardMaterial color={color} roughness={0.95} /></mesh>
   )
   return (
-    <group>
-      {ball("body", [0, 0.5, 0], 0.36, FUR, [1, 1.12, 0.92])}
-      {ball("belly", [0, 0.47, -0.2], 0.24, CREAM, [1, 1.1, 0.6])}
-      {ball("head", [0, 1.05, 0], 0.3, FUR)}
-      {ball("earL", [-0.22, 1.31, 0], 0.11, FUR)}{ball("earR", [0.22, 1.31, 0], 0.11, FUR)}
-      {ball("earLi", [-0.22, 1.31, -0.05], 0.06, DARK)}{ball("earRi", [0.22, 1.31, -0.05], 0.06, DARK)}
-      {ball("snout", [0, 0.98, -0.26], 0.12, CREAM, [1.1, 0.85, 0.8])}
-      {ball("nose", [0, 1.02, -0.36], 0.04, EYE)}
-      {ball("eyeL", [-0.11, 1.12, -0.27], 0.03, EYE)}{ball("eyeR", [0.11, 1.12, -0.27], 0.03, EYE)}
-      {ball("armL", [-0.36, 0.58, -0.04], 0.12, FUR, [0.8, 1.5, 0.8])}{ball("armR", [0.36, 0.58, -0.04], 0.12, FUR, [0.8, 1.5, 0.8])}
-      {ball("legL", [-0.17, 0.12, -0.04], 0.14, DARK, [1, 0.8, 1.2])}{ball("legR", [0.17, 0.12, -0.04], 0.14, DARK, [1, 0.8, 1.2])}
-      {/* its own smart glasses */}
-      <mesh position={[-0.11, 1.12, -0.29]}><torusGeometry args={[0.07, 0.014, 8, 24]} /><meshBasicMaterial color={INK} /></mesh>
-      <mesh position={[0.11, 1.12, -0.29]}><torusGeometry args={[0.07, 0.014, 8, 24]} /><meshBasicMaterial color={INK} /></mesh>
-      <mesh position={[0, 1.12, -0.3]} rotation={[0, 0, Math.PI / 2]}><cylinderGeometry args={[0.008, 0.008, 0.08, 6]} /><meshBasicMaterial color={INK} /></mesh>
+    <group ref={root}>
+      <hemisphereLight args={["#ffffff", "#5a4a3a", 2.2]} />
+      <directionalLight position={[1.5, 3, -2]} intensity={1.6} />
+      <group ref={torso}>
+        {ball("body", [0, 0.56, 0], 0.36, FUR, [1, 1.1, 0.92])}
+        {ball("belly", [0, 0.54, -0.17], 0.27, CREAM, [0.95, 1.05, 0.6])}
+        {ball("tail", [0, 0.36, 0.33], 0.08, FUR)}
+        <group ref={armL} position={[-0.36, 0.78, 0]}>
+          <mesh position={[-0.03, -0.2, 0]} scale={[0.8, 1.7, 0.8]}><sphereGeometry args={[0.12, 20, 14]} />{fur}</mesh>
+          {/* the wristband */}
+          <mesh position={[-0.04, -0.33, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.105, 0.105, 0.09, 20]} /><meshStandardMaterial color={INKY} roughness={0.7} /></mesh>
+          <mesh position={[-0.04, -0.33, -0.1]}><boxGeometry args={[0.07, 0.05, 0.02]} /><meshStandardMaterial color="#B9B9B5" metalness={0.8} roughness={0.3} /></mesh>
+        </group>
+        <group ref={armR} position={[0.36, 0.78, 0]}>
+          <mesh position={[0.03, -0.2, 0]} scale={[0.8, 1.7, 0.8]}><sphereGeometry args={[0.12, 20, 14]} />{fur}</mesh>
+        </group>
+        <group ref={head} position={[0, 1.02, 0]}>
+          {ball("head", [0, 0.1, 0], 0.31, FUR)}
+          {ball("earL", [-0.24, 0.34, 0.02], 0.1, FUR)}{ball("earR", [0.24, 0.34, 0.02], 0.1, FUR)}
+          {ball("earLi", [-0.24, 0.34, -0.03], 0.055, DARK)}{ball("earRi", [0.24, 0.34, -0.03], 0.055, DARK)}
+          {ball("muzzle", [0, 0.03, -0.26], 0.13, CREAM, [1.1, 0.85, 0.8])}
+          {ball("nose", [0, 0.07, -0.37], 0.045, INKY)}
+          {ball("eyeL", [-0.115, 0.16, -0.275], 0.035, INKY)}{ball("eyeR", [0.115, 0.16, -0.275], 0.035, INKY)}
+          {ball("glintL", [-0.105, 0.172, -0.305], 0.011, "#FFFFFF")}{ball("glintR", [0.125, 0.172, -0.305], 0.011, "#FFFFFF")}
+          {/* cap: a dome, a brim pointing forward, and the VEXO label on the front */}
+          <mesh position={[0, 0.2, 0]}><sphereGeometry args={[0.325, 24, 14, 0, Math.PI * 2, 0, Math.PI / 2]} /><meshStandardMaterial color={INKY} roughness={0.8} /></mesh>
+          <mesh position={[0, 0.21, -0.36]} rotation={[-0.12, 0, 0]} scale={[1, 1, 0.75]}><cylinderGeometry args={[0.26, 0.26, 0.025, 24, 1, false, Math.PI / 2, Math.PI]} /><meshStandardMaterial color={INKY} roughness={0.8} /></mesh>
+          <mesh position={[0, 0.33, -0.285]} rotation={[-0.62, 0, 0]}><planeGeometry args={[0.3, 0.11]} /><meshBasicMaterial map={label} toneMapped={false} /></mesh>
+        </group>
+      </group>
+      <group ref={legL} position={[-0.17, 0.3, 0]}><mesh position={[0, -0.16, -0.02]} scale={[1, 1.25, 1.15]}><sphereGeometry args={[0.14, 20, 14]} /><meshStandardMaterial color={DARK} roughness={0.95} /></mesh></group>
+      <group ref={legR} position={[0.17, 0.3, 0]}><mesh position={[0, -0.16, -0.02]} scale={[1, 1.25, 1.15]}><sphereGeometry args={[0.14, 20, 14]} /><meshStandardMaterial color={DARK} roughness={0.95} /></mesh></group>
     </group>
   )
 }
 
 /** The wearer, live: a body where the phone says they are, and a view cone turned by the phone's compass plus the glasses' head turn. */
 function Wearer({ track, onMove }: { track: Track; onMove: (p: THREE.Vector3) => void }) {
-  const body = useRef<THREE.Group>(null), cone = useRef<THREE.Group>(null), ring = useRef<THREE.Mesh>(null), bear = useRef<THREE.Group>(null)
+  const body = useRef<THREE.Group>(null), cone = useRef<THREE.Group>(null), ring = useRef<THREE.Mesh>(null)
   const goal = useMemo(() => new THREE.Vector3(), [])
-  // The mascot picture (a cut-out drawing), if the file is there. It always faces the viewer, like a paper figure in a game.
-  // Without the file the wearer is the bear made of plain shapes.
-  const sprite = useRef<THREE.Mesh>(null)
-  const [art, setArt] = useState<THREE.Texture | null>(null)
-  useEffect(() => {
-    let alive = true
-    new THREE.TextureLoader().load("/twin-local/bear.png", (t) => { t.colorSpace = THREE.SRGBColorSpace; if (alive) setArt(t) }, undefined, () => {})
-    return () => { alive = false }
-  }, [])
-  const artAspect = art ? (art.image as { width: number; height: number }).width / (art.image as { width: number; height: number }).height : 1
   useFrame((state, dt) => {
     goal.set(track.pos[0], 0, track.pos[1])
-    const moving = body.current ? body.current.position.distanceTo(goal) > 0.04 : false
-    if (body.current) { body.current.position.lerp(goal, Math.min(1, dt * 6)); onMove(body.current.position) }
-    if (bear.current) {
-      // The bear faces the way the body faces (phone compass) and waddles while it walks.
-      const t = state.clock.elapsedTime
-      bear.current.rotation.set(0, art ? 0 : -track.heading, !art && moving ? Math.sin(t * 11) * 0.09 : 0)
-      bear.current.position.y = moving ? Math.abs(Math.sin(t * 11)) * 0.07 : Math.sin(t * 2) * 0.015
-      if (sprite.current) { sprite.current.quaternion.copy(state.camera.quaternion); sprite.current.rotateZ(moving ? Math.sin(t * 11) * 0.1 : Math.sin(t * 1.6) * 0.02) }
-    }
+    // Glide to where the phone says we are. Slower than before, so counted steps turn into a walk and not a jump.
+    if (body.current) { body.current.position.lerp(goal, Math.min(1, dt * 5)); onMove(body.current.position) }
     if (cone.current) {
       const yaw = -(track.heading + track.head.yaw) // heading is clockwise from "up the screen"; three.js turns the other way
       cone.current.rotation.set(0, 0, 0); cone.current.rotateY(yaw); cone.current.rotateX(-track.head.pitch)
@@ -295,13 +361,9 @@ function Wearer({ track, onMove }: { track: Track; onMove: (p: THREE.Vector3) =>
   const lines: [number, number, number][] = [[0, 0, 0], [-0.55, 0.4, -1.5], [0.55, 0.4, -1.5], [0, 0, 0], [0.55, -0.4, -1.5], [-0.55, -0.4, -1.5], [0, 0, 0], [-0.55, 0.4, -1.5], [-0.55, -0.4, -1.5], [0.55, -0.4, -1.5], [0.55, 0.4, -1.5]]
   return (
     <group ref={body}>
-      <group ref={bear}>
-        {art
-          ? <mesh ref={sprite} position={[0, 0.82, 0]}><planeGeometry args={[1.64 * artAspect, 1.64]} /><meshBasicMaterial map={art} transparent alphaTest={0.08} toneMapped={false} side={THREE.DoubleSide} /></mesh>
-          : <Bear />}
-      </group>
+      <Bear3D track={track} body={body} />
       <mesh ref={ring} position={[0, 0.02, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.28, 0.32, 48]} /><meshBasicMaterial color={GLOW} transparent /></mesh>
-      <group ref={cone} position={[0, 1.18, 0]}><Line points={lines} color={GLOW} lineWidth={1.8} /></group>
+      <group ref={cone} position={[0, 1.2, 0]}><Line points={lines} color={GLOW} lineWidth={1.2} transparent opacity={0.55} /></group>
       <pointLight position={[0, 1.4, 0]} color={GLOW} intensity={6} distance={5} />
     </group>
   )
@@ -316,14 +378,14 @@ type Placing = null | { step: 1 } | { step: 2; a: [number, number] }
 const turn = (x: number, z: number, yaw: number): [number, number] => [x * Math.cos(yaw) + z * Math.sin(yaw), -x * Math.sin(yaw) + z * Math.cos(yaw)] // same turn three.js makes for rotation.y
 const bearing = (x: number, z: number) => Math.atan2(x, -z) // clockwise from "up the screen", like the phone's heading
 
-function TrackScene({ track, pins, space, splat, flip, onSplatFail, onSplatReady, cal, align, placing, onPlace }: { track: Track | null; pins: Pin[]; space: Recon | null; splat: boolean; flip: boolean; onSplatFail: () => void; onSplatReady: () => void; cal: Cal; align: Align; placing: Placing; onPlace: (x: number, z: number) => void }) {
+function TrackScene({ track, pins, space, splat, flip, drop, onSplatFail, onSplatReady, cal, align, placing, onPlace }: { track: Track | null; pins: Pin[]; space: Recon | null; splat: boolean; flip: boolean; drop: number; onSplatFail: () => void; onSplatReady: (floors: [number, number]) => void; cal: Cal; align: Align; placing: Placing; onPlace: (x: number, z: number) => void }) {
   const controls = useRef<React.ComponentRef<typeof OrbitControls>>(null)
   const path = useMemo(() => (track?.path ?? []).map(([x, z]) => [x, 0.04, z] as [number, number, number]), [track?.path])
   let last: [number, number] = track?.pos ?? [0, 0]
   return (
     <>
       <gridHelper args={[60, 60, "#1B2140", "#10142A"]} position={[0, -0.02, 0]} />
-      {(space || splat) && <group position={[cal.x + align.x, 0, cal.z + align.z]} rotation={[0, cal.yaw + align.yaw, 0]} scale={cal.scale}>{splat ? <Splat onFail={onSplatFail} onReady={onSplatReady} flip={flip} /> : space && <Cloud recon={space} />}</group>}
+      {(space || splat) && <group position={[cal.x + align.x, splat ? -drop * cal.scale : 0, cal.z + align.z]} rotation={[0, cal.yaw + align.yaw, 0]} scale={cal.scale}>{splat ? <Splat onFail={onSplatFail} onReady={onSplatReady} flip={flip} /> : space && <Cloud recon={space} />}</group>}
       {/* While placing, the floor takes clicks and the view stops turning. */}
       {placing && <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]} onPointerDown={(e) => { e.stopPropagation(); onPlace(e.point.x, e.point.z) }}><planeGeometry args={[200, 200]} /><meshBasicMaterial transparent opacity={0} depthWrite={false} /></mesh>}
       {placing?.step === 2 && <mesh position={[placing.a[0], 0.03, placing.a[1]]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.25, 0.34, 40]} /><meshBasicMaterial color={GOLD} /></mesh>}
@@ -335,12 +397,18 @@ function TrackScene({ track, pins, space, splat, flip, onSplatFail, onSplatReady
         if (!c || placing) return
         const dx = (p.x - c.target.x) * 0.08, dy = (0.9 - c.target.y) * 0.08, dz = (p.z - c.target.z) * 0.08
         c.target.x += dx; c.target.y += dy; c.target.z += dz
-        c.object.position.x += dx; c.object.position.z += dz
+        const cam = c.object.position
+        cam.x += dx; cam.z += dz
+        // Never inside the wearer: at least 2.5 m away along the floor-plus-height line, and at least 1.2 m above the look-at point.
+        const ox = cam.x - c.target.x, oy = cam.y - c.target.y, oz = cam.z - c.target.z
+        const dist = Math.hypot(ox, oy, oz)
+        if (dist < 2.5) { const k = 2.5 / Math.max(dist, 0.01); cam.x = c.target.x + ox * k; cam.y = c.target.y + oy * k; cam.z = c.target.z + oz * k }
+        if (cam.y < c.target.y + 1.2) cam.y = c.target.y + 1.2
         c.update()
       }} />
         : space && <mesh position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.2, 0.27, 40]} /><meshBasicMaterial color={INK} /></mesh>}
       {pins.map((p, i) => { const at = p.where ?? [last[0] + (i ? 0.9 : 0), last[1]]; last = at; return <PinCard key={p.id} pin={p} at={at} /> })}
-      <OrbitControls ref={controls} enabled={!placing} enablePan={false} target={[0, 0.9, 0]} minDistance={1} maxDistance={40} maxPolarAngle={Math.PI / 2.05} autoRotate={!placing} autoRotateSpeed={0.35} />
+      <OrbitControls ref={controls} enabled={!placing} enablePan={false} target={[0, 0.9, 0]} minDistance={2.5} maxDistance={40} maxPolarAngle={Math.PI / 2.6} autoRotate={!placing} autoRotateSpeed={0.35} />
     </>
   )
 }
@@ -354,7 +422,11 @@ function LiveRoom({ track, pins, space, cal }: { track: Track | null; pins: Pin[
   useEffect(() => { fetch(WORLD, { method: "HEAD" }).then((r) => setSplat(r.ok && Number(r.headers.get("content-length") ?? 1) > 1000)).catch(() => setSplat(false)) }, [])
   const dropSplat = useMemo(() => () => setSplat(false), [])
   const [ready, setReady] = useState(false)
-  const splatReady = useMemo(() => () => setReady(true), [])
+  const [floors, setFloors] = useState<[number, number]>([0, 0]) // floor height found in the world, as saved and flipped
+  const [lift, setLift] = useState(0) // hand correction on top of that, in metres of world height
+  useEffect(() => { try { setLift(Number(localStorage.getItem("vb-lift")) || 0) } catch { /* nothing saved */ } }, [])
+  const nudgeLift = (d: number) => setLift((v) => { const n = Math.round((v + d) * 100) / 100; try { localStorage.setItem("vb-lift", String(n)) } catch { /* private window */ } return n })
+  const splatReady = useMemo(() => (f: [number, number]) => { setFloors(f); setReady(true) }, [])
   const [flip, setFlip] = useState(false) // the Marble export was saved as OpenGL, ground level, so it should already be upright
   useEffect(() => { try { setFlip(localStorage.getItem("vb-flip") === "1") } catch { /* nothing saved */ } }, [])
   useEffect(() => { try { const saved = localStorage.getItem("vb-align-2"); if (saved) setAlign(JSON.parse(saved)) } catch { /* nothing saved */ } }, [])
@@ -382,10 +454,10 @@ function LiveRoom({ track, pins, space, cal }: { track: Track | null; pins: Pin[
   return (
     <div className="relative h-full w-full">
       {/* Starts close, just behind and above the wearer, inside the room rather than looking down on it from far away. */}
-      <Canvas dpr={[1, 1.75]} camera={{ position: [1.8, 2.3, 3.6], fov: 50, near: 0.05 }} gl={{ antialias: true }}>
+      <Canvas dpr={[1, 1.75]} camera={{ position: [2.2, 3.2, 4.4], fov: 50, near: 0.05 }} gl={{ antialias: true }}>
         <color attach="background" args={["#05060A"]} />
         <Stars radius={60} depth={30} count={2200} factor={3} saturation={0} fade speed={0.6} />
-        <TrackScene track={track} pins={pins} space={space} splat={splat} flip={flip} onSplatFail={dropSplat} onSplatReady={splatReady} cal={cal} align={align} placing={placing} onPlace={onPlace} />
+        <TrackScene track={track} pins={pins} space={space} splat={splat} flip={flip} drop={(flip ? floors[1] : floors[0]) + lift} onSplatFail={dropSplat} onSplatReady={splatReady} cal={cal} align={align} placing={placing} onPlace={onPlace} />
         <EffectComposer>
           <Bloom intensity={space ? 0.25 : 0.9} luminanceThreshold={space ? 0.9 : 0.55} luminanceSmoothing={0.3} mipmapBlur />
           <Vignette eskil={false} offset={0.2} darkness={0.75} />
@@ -396,6 +468,8 @@ function LiveRoom({ track, pins, space, cal }: { track: Track | null; pins: Pin[
         <div className="absolute left-3 top-9 flex items-center gap-2 text-xs">
           <button data-place onClick={() => setPlacing(placing ? null : { step: 1 })} className={`rounded-full px-3 py-1 font-semibold ${placing ? "bg-[#FFD100] text-[#0B0B0C]" : "border border-[#3A3A3F] bg-black/50 text-[#D3D3D1]"}`}>{placing ? "Cancel" : "Place me"}</button>
           {splat && !placing && <button onClick={() => { const n = !flip; setFlip(n); try { localStorage.setItem("vb-flip", n ? "1" : "0") } catch { /* private window */ } }} className="rounded-full border border-[#3A3A3F] bg-black/50 px-3 py-1 text-[#D3D3D1]">Flip</button>}
+          {splat && !placing && <button onClick={() => nudgeLift(0.1)} title="Lower the room: use it when the bear stands sunk into the floor" className="rounded-full border border-[#3A3A3F] bg-black/50 px-2.5 py-1 text-[#D3D3D1]">Floor ↓</button>}
+          {splat && !placing && <button onClick={() => nudgeLift(-0.1)} title="Raise the room: use it when the bear floats above the floor" className="rounded-full border border-[#3A3A3F] bg-black/50 px-2.5 py-1 text-[#D3D3D1]">Floor ↑</button>}
           {splat && !placing && <button onClick={() => setSplat(false)} title="Show the point cloud rebuilt from the video instead" className="rounded-full border border-[#3A3A3F] bg-black/50 px-3 py-1 text-[#D3D3D1]">Points</button>}
           {placing && <span className="rounded-full bg-black/70 px-3 py-1 text-[#F4F4F2]">{placing.step === 1 ? "1 of 2 · click the floor where you are standing" : "2 of 2 · click the thing you are facing"}</span>}
         </div>

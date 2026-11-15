@@ -10,9 +10,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import dynamic from "next/dynamic"
 import { ZONES, type Seen } from "./world"
+import { createBandGate } from "./band-gate.mjs"
 import { loadRecon, type Cal, type Pin, type Recon, type Track as LiveTrack } from "./pin-room"
 
-const PinRoom = dynamic(() => import("./pin-room"), { ssr: false })
+const PinRoom = dynamic(() => import("./pin-room"), { ssr: false, loading: () => <p className="absolute inset-0 grid place-items-center text-xs text-[#77777A]">Loading the 3D view…</p> })
 
 type Track = { fps: number; rows: { zone: string | null; objects: Seen["objects"] }[] }
 type Offer = { title: string; priceCents: number; seller: string; sellerUrl: string | null; url: string | null; image: string | null }
@@ -24,11 +25,17 @@ type Ask = {
   shot?: string | null; box?: number[] | null; zone?: string | null // annotated capture: the frame, the thing in it, and where
   depth?: string | null // estimated depth picture of the frame, for the relief card in the 3D view
   reading?: { what: string; value: string; unit: string } | null // a value read or said out loud, kept as data
-  kind: "find" | "note" | "email"
+  kind: "find" | "note" | "email" | "quote"
+  quote?: Quote | null
   steps: Step[]; offers: Offer[]; pick: number; found: number
   status: "working" | "ready" | "paying" | "paid" | "skipped" | "noted" | "failed"
   paid: Paid | null
 }
+// A customer quote built from the selected offer. Labor and margin are what the wearer said, else the shown defaults.
+type Quote = { item: string; seller: string; partCents: number; read: string; laborCents: number; laborSaid: boolean; marginPct: number; marginSaid: boolean; at: string }
+const QUOTE_LABOR_CENTS = 12000 // default labor when none is said: shown on the quote as a default
+const QUOTE_MARGIN_PCT = 20 // default margin on the part when none is said: shown on the quote as a default
+const quoteTotals = (q: Quote) => { const margin = Math.round(q.partCents * q.marginPct / 100); return { margin, total: q.partCents + margin + q.laborCents } }
 type SeenRow = { key: number; t: number; label: string; thumb: string | null }
 
 const usd = (cents: number) => (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" })
@@ -36,6 +43,7 @@ const clock = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${S
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} S`
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const typing = (text: string) => sleep(Math.min(520, text.length * 5) + 120) // time for a line to finish typing
+const stageLog = (text: string) => { void fetch("/api/twin/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: "stage", text }) }).catch(() => {}) }
 const post = async (url: string, body: unknown) => { const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); return { ok: r.ok, d: await r.json() } }
 
 /** Types a line out, a few characters at a time, each time the text changes. */
@@ -49,8 +57,9 @@ function Typed({ text }: { text: string }) {
   return <>{text.slice(0, n)}</>
 }
 
-const LIVE_PROMPT = `You are Bearly, a quick, warm shopping assistant living in the user's camera glasses. You hear them and you see what they see: you get one video frame a second.
-Talk like a friend standing next to them. English only. One short sentence whenever you can, two at most. Plain speech: no lists, no markdown, never read out a long product title.
+const LIVE_PROMPT = `RESPOND IN ENGLISH. YOU MUST RESPOND UNMISTAKABLY IN ENGLISH.
+You are Bearly, a quick, warm shopping assistant living in the user's camera glasses. You hear them and you see what they see: you get one video frame a second.
+Talk like a friend standing next to them. The user ONLY ever speaks English (with a Korean accent, in a loud room). If what you hear sounds like Spanish, Japanese or any other language, it is English you misheard: work out the most likely English words and answer in English. Never reply in another language. One short sentence whenever you can, two at most. Plain speech: no lists, no markdown, never read out a long product title.
 Never say something is found, bought, drafted or shown unless the tool result for it has come back. Only say you are working on it while a tool call is actually running.
 Do not end a question with a tag like "okay?" or "confirm?"; ask it plainly.
 If you did not catch something, ask about the nearest likely meaning in a few words.
@@ -58,17 +67,22 @@ When they show, hold up or point at something and want to know what it is, what 
 After find_product returns, check the titles. Position 1 is the cheapest but may be a part, an accessory or a wrongly priced listing. If it is not the same kind of product they showed, call select_offer with the cheapest position that is. Then say that price and seller in one sentence and ask if they want it. If nothing is the exact product, say it is the closest match.
 Prices, sellers and totals come only from tool results. Never make one up.
 Buy only after a clear yes to a specific offer. Then call buy_selected at once, without talking first, and confirm the amount in a few words when it returns. If they want a different one, call next_offer. If they say no, call skip_offer.
+If they say quote it, make a quote, or price it for the customer, call create_quote. Pass labor_dollars and margin_percent only if they said them, and read_on_part with the exact model or nameplate text you read on the part (empty if you read none). Then say the quote total in one sentence and ask if they want to order the part. A yes (yup, yes, do it) after a quote means buy_selected.
+Drafts are not sent by themselves. Only when they clearly say send it (send the quote, send it to my manager), call send_email with which quote or manager, then say it is sent in a few words.
 If they ask to email their manager the invoice or report, call email_manager and say it is drafted on screen. If they ask to see the invoice, the report, or the board (also called canvas, dashboard, or everything you saw), call show_document. If they say close it, call close_document.
 If they say something about the condition of equipment that belongs in an inspection report, call add_note and acknowledge in two or three words.
 If they are just chatting or testing the mic, chat back briefly. If you did not catch it, say so in a few words.`
 const LIVE_TOOLS = [
   { name: "find_product", description: "Search real shops for the product the user is showing or asking about. Returns offers sorted by price, and puts them on the user's screen.", parameters: { type: "OBJECT", properties: { query: { type: "STRING", description: "Shopping search query: brand, product name, size or colour, 3 to 8 words" } }, required: ["query"] } },
+  { name: "open_store_page", description: "Open the real store page of the product on screen in a new browser tab. Use when the user says open it, show me the page, or where is it sold.", parameters: { type: "OBJECT", properties: {} } },
   { name: "select_offer", description: "Put a specific offer from the last find_product result on screen as the selected one. Use it when position 1 is not really the product the user showed.", parameters: { type: "OBJECT", properties: { position: { type: "NUMBER", description: "Position in offers_cheapest_first, starting at 1" } }, required: ["position"] } },
   { name: "next_offer", description: "Select the next offer in the open list and show it." },
   { name: "buy_selected", description: "Pay for the currently selected offer. Only after the user clearly said yes." },
   { name: "skip_offer", description: "Dismiss the open offer because the user does not want it." },
+  { name: "create_quote", description: "Make a customer quote from the offer on screen: part price, margin, labor, total. Shows it on screen with an email to the customer ready to send.", parameters: { type: "OBJECT", properties: { read_on_part: { type: "STRING", description: "Model, part number or nameplate text read on the part" }, labor_dollars: { type: "NUMBER", description: "Only if the user said a labor amount" }, margin_percent: { type: "NUMBER", description: "Only if the user said a margin" } } } },
+  { name: "send_email", description: "Really send the customer quote or the manager email (invoice and walk report). Only after the user clearly says send it. In this demo it goes to the user's own inbox.", parameters: { type: "OBJECT", properties: { which: { type: "STRING", enum: ["quote", "manager"] } }, required: ["which"] } },
   { name: "email_manager", description: "Draft the email to the user's manager with the invoice and the walk report attached, and show it on screen." },
-  { name: "show_document", description: "Show something large on screen: the invoice, the walk report, or the board (one canvas with everything seen, asked and bought in this session).", parameters: { type: "OBJECT", properties: { which: { type: "STRING", enum: ["invoice", "report", "board"] } }, required: ["which"] } },
+  { name: "show_document", description: "Show something large on screen: the invoice, the walk report, the customer quote, or the board (one canvas with everything seen, asked and bought in this session).", parameters: { type: "OBJECT", properties: { which: { type: "STRING", enum: ["invoice", "report", "quote", "board"] } }, required: ["which"] } },
   { name: "close_document", description: "Close the document that is showing." },
   { name: "add_note", description: "Write an observation about equipment into the walk report.", parameters: { type: "OBJECT", properties: { text: { type: "STRING" } }, required: ["text"] } },
 ] as never[]
@@ -103,6 +117,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   const saidRef = useRef("")
   const [said, setSaid] = useState("") // last thing the wearer said, for the caption
   const speaking = useRef(false) // true while the assistant's voice plays, so the mic does not hear it
+  const remic = useRef<() => void>(() => {}) // re-picks the microphone for the running live session
   const liveSession = useRef<{ close: () => void; text: (t: string) => void } | null>(null) // the Gemini Live session, when on
   const liveOn = useRef(false)
   const paidCount = useRef(0)
@@ -126,9 +141,22 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   const echoGateRef = useRef(true)
   useEffect(() => { echoGateRef.current = echoGate }, [echoGate])
   const cutIn = useRef<() => void>(() => {}) // stops the assistant mid-sentence and opens the mic again
+  // Vexo wrist band 67, straight to this Mac over Bluetooth: its microphone feeds the live session, a double tap approves
+  // the open offer, a single tap cuts the assistant off. Its sound becomes an ordinary audio stream (bandStream), so the
+  // live session treats it like any other microphone.
+  const bandRef = useRef<{ band: any; sound: any; ctx: AudioContext } | null>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
+  const bandStream = useRef<MediaStream | null>(null)
+  const [bandUi, setBandUi] = useState<"off" | "connecting" | "on">("off")
+  const bandGate = useRef(createBandGate())
   const glasses = useRef<{ audio: MediaStreamTrack | null; leave: () => void } | null>(null) // glasses feed over LiveKit
   const [source, setSource] = useState<"walk" | "camera" | "glasses">("walk")
   const [micLevel, setMicLevel] = useState("")
+  const liveStateRef = useRef<"off" | "connecting" | "on">("off")
+  const toggleLiveRef = useRef<(force?: boolean) => Promise<void>>(async () => {})
+  const [clicked, setClicked] = useState(false) // Chrome plays and records sound only after one click on the page
+  const touched = useRef(false) // a person has clicked or typed in this window (a hidden preview never does)
+  const startingLive = useRef(false)
+  const tabId = useRef(Math.random().toString(36).slice(2))
   // Hold-to-talk: in a loud room the mic cannot tell the wearer from the crowd, so the assistant only listens while Space
   // (or the on-screen button) is held. Letting go is the end of the sentence, so the answer starts sooner too.
   const [ptt, setPtt] = useState(false)
@@ -136,7 +164,9 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   useEffect(() => { pttRef.current = ptt; held.current = false }, [ptt])
   const [liveState, setLiveState] = useState<"off" | "connecting" | "on">("off")
   const [mic, setMic] = useState("off") // what the speech recogniser last reported, shown under the input
-  const [zoom, setZoom] = useState<"invoice" | "report" | "board" | null>(null)
+  const [sent, setSent] = useState<{ quote?: string; manager?: string }>({}) // time each email really went out (to the sender's own inbox)
+  const [zoom, setZoom] = useState<"invoice" | "report" | "quote" | "board" | null>(null)
+  const [mapOpen, setMapOpen] = useState(false) // demo: the 3D map opens full screen from the Map button
 
   useEffect(() => { asksRef.current = asks }, [asks])
   useEffect(() => { if (demo) return; fetch("/twin-local/track.json").then((r) => (r.ok ? r.json() : null)).then((t) => setTrack(t && Array.isArray(t.rows) ? t : null)).catch(() => setTrack(null)) }, [])
@@ -198,7 +228,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         if (f) {
           try { const { ok, d } = await post("/api/twin/see", { frame: f, mode: "wear", track: namedRef.current && Date.now() - namedRef.current.at < 20000 ? namedRef.current.query : undefined }); if (alive && ok) setLive(d.objects ?? []) } catch { /* next frame */ }
         }
-        await sleep(f ? 120 : 400)
+        await sleep(f ? 500 : 800) // about 1.5 Jev looks a second: enough for boxes, light on the Mac
       }
     })()
     return () => { alive = false }
@@ -337,6 +367,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
     await sleep(700)
     for (let k = 1; k <= steps.length; k++) { patch(ask.id, (a) => ({ ...a, steps: steps.slice(0, k) })); await typing(steps[k - 1].text) }
     patch(ask.id, (a) => ({ ...a, status: "ready" }))
+    setZoom("invoice") // the right panel turns into the invoice (no pop-up in the middle)
     say("The email to your manager is ready. Say show me the invoice, or send it.")
   }
 
@@ -483,8 +514,39 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       note: "Position 1 is on screen. Cheapest is not always right: some listings are parts, accessories or priced wrongly. If position 1 is not the same kind of product the user showed, call select_offer with the cheapest position that is, before you say a price.",
     }
   }
+  /** Really send it, to the sender's own inbox (the server fixes the recipient). */
+  const sendEmail = async (which: "quote" | "manager") => {
+    const asksNow = asksRef.current
+    let body: { kind: "quote" | "manager"; title: string; lines: { label: string; amount: string; note?: string }[]; total: string; footer: string }
+    if (which === "quote") {
+      const q = asksNow.find((x) => x.quote)?.quote
+      if (!q) return { error: "there is no quote yet" }
+      const { margin, total } = quoteTotals(q)
+      body = { kind: "quote", title: q.item, total: usd(total), footer: `Part price is ${q.seller}'s online store price on Shopify.${q.read ? ` Read on the part: ${q.read}.` : ""} Test mode, sample customer.`,
+        lines: [{ label: q.item, amount: usd(q.partCents) }, { label: `Margin ${q.marginPct}%`, amount: usd(margin), note: q.marginSaid ? undefined : "default" }, { label: "Labor", amount: usd(q.laborCents), note: q.laborSaid ? undefined : "default" }] }
+    } else {
+      const paid = asksNow.filter((x) => x.paid)
+      if (!paid.length) return { error: "nothing is paid yet, so there is no invoice" }
+      body = { kind: "manager", title: `${paid.length} bought on the walk`, total: usd(paid.reduce((t, x) => t + (x.paid?.amount ?? 0), 0)), footer: `Walk report: ${asksNow.filter((x) => x.kind !== "email").length} asks, ${asksNow.filter((x) => x.kind === "note").length} notes. Stripe test mode: no real money moved.`,
+        lines: paid.map((x) => ({ label: `${x.offers[x.pick].title} · ${x.offers[x.pick].seller}`, amount: usd(x.paid!.amount) })) }
+    }
+    const { ok, d } = await post("/api/twin/send-email", body)
+    if (!ok || !d.sent) return { sent: false, error: d.error || "the email did not go out" }
+    const at = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    setSent((x) => ({ ...x, [which]: at }))
+    setZoom(which === "quote" ? "quote" : "invoice")
+    return { sent: true, to: "the user's own inbox", at }
+  }
+
   toolsRef.current = {
     find_product: async (a) => liveFind(String(a.query ?? "").slice(0, 80), saidRef.current),
+    open_store_page: async () => {
+      const o = asksRef.current.find((x) => x.kind === "find" && x.offers.length > 0)
+      const offer = o ? o.offers[o.pick] : null
+      if (!offer?.url) return { error: "no store page for the offer on screen" }
+      const w = window.open(offer.url, "_blank", "noopener")
+      return w ? { opened: offer.url, seller: offer.seller } : { opened: false, note: "The browser blocked it. Tell the user to click 'View on the store' under the product." }
+    },
     select_offer: async (a) => {
       const o = openOffer()
       if (!o) return { error: "no offers are open" }
@@ -509,9 +571,31 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
     email_manager: async () => {
       if (!paidCount.current) return { error: "nothing is paid yet, so there is no invoice" }
       void email(saidRef.current || "Email my manager the invoice and the report")
-      return { drafted: true, attachments: ["Invoice.pdf", "Walk report.pdf"], sent: false, note: "The email is drafted on screen. Actually sending it is not connected yet." }
+      return { drafted: true, attachments: ["Invoice.pdf", "Walk report.pdf"], sent: false, note: "The email is drafted on screen, not sent. It goes out only if they say send it (send_email)." }
     },
-    show_document: async (a) => { if (a.which === "board") { setZoom("board"); return { showing: "board of everything seen, asked and bought in this session" } }; const which = a.which === "report" ? "report" : "invoice"; if (which === "invoice" && !paidCount.current) return { error: "nothing is paid yet" }; setZoom(which); return { showing: which } },
+    send_email: async (a) => sendEmail(a.which === "quote" ? "quote" : "manager"),
+    create_quote: async (a) => {
+      const o = asksRef.current.find((x) => x.kind === "find" && x.offers.length > 0 && x.status !== "skipped" && x.status !== "failed")
+      if (!o) return { error: "there is no part on screen to quote yet, find it first" }
+      const offer = o.offers[o.pick]
+      const labor = Number(a.labor_dollars), margin = Number(a.margin_percent)
+      const q: Quote = {
+        item: offer.title, seller: offer.seller, partCents: offer.priceCents, read: String(a.read_on_part ?? "").trim().slice(0, 80),
+        laborCents: labor > 0 ? Math.round(labor * 100) : QUOTE_LABOR_CENTS, laborSaid: labor > 0,
+        marginPct: margin >= 0 && a.margin_percent !== undefined && !Number.isNaN(margin) ? Math.min(200, margin) : QUOTE_MARGIN_PCT, marginSaid: a.margin_percent !== undefined && !Number.isNaN(margin),
+        at: new Date().toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }),
+      }
+      const { margin: m, total } = quoteTotals(q)
+      const ask = add(saidRef.current || "Quote it", "quote", "ready", [
+        { text: `Part ${usd(q.partCents)} · ${q.seller}`, tag: "SHOPIFY", state: "done" },
+        { text: `Margin ${q.marginPct}%${q.marginSaid ? "" : " (default)"} · Labor ${usd(q.laborCents)}${q.laborSaid ? "" : " (default)"}`, tag: "QUOTE", state: "done" },
+        { text: `Quote total ${usd(total)} · email to the customer ready to send`, tag: "QUOTE", state: "done" },
+      ])
+      patch(ask.id, (x) => ({ ...x, quote: q }))
+      setZoom("quote")
+      return { quote_total: usd(total), part: usd(q.partCents), margin: `${q.marginPct}% = ${usd(m)}${q.marginSaid ? "" : " (default, not said)"}`, labor: `${usd(q.laborCents)}${q.laborSaid ? "" : " (default, not said)"}`, customer_email: "drafted, ready to send, not sent", next: "ask if they want to order the part; a yes means buy_selected" }
+    },
+    show_document: async (a) => { if (a.which === "board") { setZoom("board"); return { showing: "board of everything seen, asked and bought in this session" } }; if (a.which === "quote") { if (!asksRef.current.some((x) => x.quote)) return { error: "no quote yet" }; setZoom("quote"); return { showing: "quote" } }; const which = a.which === "report" ? "report" : "invoice"; if (which === "invoice" && !paidCount.current) return { error: "nothing is paid yet" }; setZoom(which); return { showing: which } },
     close_document: async () => { setZoom(null); return { closed: true } },
     add_note: async (a) => { add(String(a.text ?? saidRef.current), "note", "noted"); return { noted: true } },
     record_reading: async (a) => {
@@ -523,8 +607,136 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
     },
   }
 
-  const toggleLive = async (useFallback = false) => {
+  // ── Band ──
+  const askable = () => { const o = openOffer(); return o && o.status === "ready" ? o : undefined }
+  // A double tap counts for ten seconds after the assistant last spoke about an open offer, and once per question.
+  useEffect(() => { if (askable()) bandGate.current.arm(Date.now()); else bandGate.current.disarm() }, [reply, asks]) // eslint-disable-line react-hooks/exhaustive-deps
+  const bandTap = (kind: "tap" | "double-tap") => {
+    // A single tap no longer cuts the assistant off: moving the arm while talking registered as taps and silently threw away
+    // the rest of each answer (the subtitles kept coming, the voice stopped). Only the double tap is used.
+    if (kind === "tap") return
+    if (bandGate.current.onTap("double-tap", { now: Date.now(), offerOpen: !!askable(), speaking: false }) !== "approve") return
+    setSaid("(double tap on the wrist band)")
+    // The tap is the approval, so the payment starts at once. The assistant only announces the result.
+    void toolsRef.current.buy_selected({}).then((result) => {
+      liveSession.current?.text(`I approved the purchase with a double tap on my wrist band. It has already been processed, so do not call any tool. The result was: ${JSON.stringify(result)}. Tell me the outcome in one short sentence.`)
+    })
+  }
+  const toggleBandRef = useRef<(silent?: boolean) => Promise<void>>(async () => {})
+  const bandLoop = useRef(false)
+  const bandFails = useRef(0)
+  const bandNeverPicked = useRef(false) // Chrome has no remembered band yet: only then is the one-time chooser needed
+  const bandTapRef = useRef(bandTap)
+  useEffect(() => { bandTapRef.current = bandTap })
+  const dropBand = async () => {
+    const b = bandRef.current
+    bandRef.current = null; bandStream.current = null; setBandUi("off")
+    remic.current() // back to the glasses or Mac microphone
+    if (!b) return
+    try { await b.band.configure({ audio: false, events: false }); await b.band.disconnect() } catch { /* already gone */ }
+    b.sound.close(); void b.ctx.close()
+  }
+  // The band connected to the iPhone: its Opus packets arrive over LiveKit and are decoded here, exactly like the band
+  // on the Mac's own Bluetooth, into the same stream the live session reads.
+  const phoneBand = useRef<{ sound: { push: (a: any) => void; close: () => void }; ctx: AudioContext } | null>(null)
+  const phoneBandStarting = useRef(false)
+  const phoneBandAudio = async (payload: Uint8Array) => {
+    if (payload.length < 3) return
+    if (!phoneBand.current) {
+      if (phoneBandStarting.current) return
+      phoneBandStarting.current = true
+      try {
+        const { BandAudio } = await import("@/components/vexo/index.js")
+        const ctx = new AudioContext({ sampleRate: 16000 })
+        const dest = ctx.createMediaStreamDestination()
+        let at = 0
+        const sound = new BandAudio((samples: Float32Array) => {
+          const buf = ctx.createBuffer(1, samples.length, 16000)
+          buf.getChannelData(0).set(samples)
+          const src = ctx.createBufferSource()
+          src.buffer = buf; src.connect(dest)
+          at = Math.max(ctx.currentTime + 0.06, at) // a little more slack: the packets cross the internet twice
+          src.start(at); at += buf.duration
+        })
+        phoneBand.current = { sound, ctx }
+        bandStream.current = dest.stream; setBandUi("on"); stageLog("band sound is arriving from the phone")
+        remic.current()
+      } finally { phoneBandStarting.current = false }
+    }
+    const seq = (payload[0] << 8) | payload[1]
+    phoneBand.current?.sound.push({ seq, opus: payload.slice(2), time: Date.now() })
+  }
+  const dropPhoneBand = () => {
+    const b = phoneBand.current
+    if (!b) return
+    phoneBand.current = null
+    if (!bandRef.current) { bandStream.current = null; setBandUi("off"); remic.current() }
+    try { b.sound.close() } catch { /* already closed */ } void b.ctx.close()
+  }
+
+  /** silent: only reconnect a band this site already picked once (no chooser, works without a click, e.g. on page load). */
+  const toggleBand = async (silent = false) => {
+    if (bandRef.current) { if (!silent) await dropBand(); return }
+    if (bandUi === "connecting") return
+    setBandUi("connecting"); if (!silent) setMic("band: double-tap band 67, then pick Vexo-HACK-67")
+    try {
+      const { Band, BandAudio, canDecodeAudio } = await import("@/components/vexo/index.js")
+      if (!(await canDecodeAudio())) throw new Error("this browser cannot decode the band's sound, use Chrome")
+      const { WebBluetoothTransport } = await import("@/components/vexo/transports/web-bluetooth.js")
+      const transport = new WebBluetoothTransport(67) as InstanceType<typeof WebBluetoothTransport> & { silent?: boolean }
+      transport.silent = silent
+      const band = await Band.connect(67, { autoReconnect: true, transport })
+      // The band's 20 ms pieces of sound are played, in order, into a silent audio stream that the live session reads.
+      const ctx = new AudioContext({ sampleRate: 16000 })
+      const dest = ctx.createMediaStreamDestination()
+      let at = 0
+      const sound = new BandAudio((samples: Float32Array) => {
+        const buf = ctx.createBuffer(1, samples.length, 16000)
+        buf.getChannelData(0).set(samples)
+        const src = ctx.createBufferSource()
+        src.buffer = buf; src.connect(dest)
+        at = Math.max(ctx.currentTime + 0.04, at) // 40 ms of slack against Bluetooth jitter
+        src.start(at); at += buf.duration
+      })
+      bandRef.current = { band, sound, ctx }
+      band.on("audio", (a: unknown) => sound.push(a as { seq: any; opus: any }))
+      band.on("tap", () => bandTapRef.current("tap"))
+      band.on("double-tap", () => bandTapRef.current("double-tap"))
+      band.on("reconnecting", () => setMic("band: link dropped, reconnecting…"))
+      band.on("reconnected", () => { sound.restart(); at = 0; void band.configure({ audio: true, events: true }); setMic("band: back") })
+      band.on("disconnect", () => { if (bandRef.current?.band === band) void dropBand() })
+      await band.configure({ audio: true, events: true }) // the band light goes solid blue: its microphone is on
+      bandStream.current = dest.stream
+      setBandUi("on"); bandFails.current = 0; setBandFirstTime(false); stageLog("band 67 connected, its mic is on")
+      remic.current() // the running live session switches to the band without restarting
+      if (!liveSession.current) setMic("band 67: connected, microphone on. Talk live uses it.")
+    } catch (e) {
+      const b = bandRef.current
+      bandRef.current = null; bandStream.current = null; setBandUi("off")
+      try { await b?.band.disconnect() } catch { /* already gone */ }
+      if (!silent) setMic(`band: ${e instanceof Error ? e.message : String(e)}`)
+      stageLog(`band ${silent ? "auto-connect" : "connect"} failed: ${e instanceof Error ? e.message : String(e)}`)
+      bandNeverPicked.current = silent && /no band remembered/i.test(e instanceof Error ? e.message : String(e))
+      bandFails.current += 1
+      setBandFirstTime(bandNeverPicked.current || bandFails.current >= 3) // after a few quiet failures, offer the chooser
+    }
+  }
+  useEffect(() => { toggleBandRef.current = (silent?: boolean) => toggleBand(!!silent) })
+  useEffect(() => () => { void dropBand() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleLive = async (useFallback = false, force = false) => {
     if (liveSession.current) { liveSession.current.close(); return }
+    // Only one session may be starting at a time. Without this, a click on "Talk live" while the auto-start was still
+    // connecting opened a second session, and two assistants answered every question.
+    if (startingLive.current && !useFallback) return
+    startingLive.current = true
+    // And only one page anywhere: another window with this page open (another browser, a preview pane) also hears the
+    // phone's Hold to talk. The server keeps one owner; a page that is not it does not start.
+    if (!useFallback) {
+      const claim = await fetch("/api/twin/live-owner", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: tabId.current, force }) })
+        .then((r) => r.json()).catch(() => ({ ok: true }))
+      if (!claim.ok) { startingLive.current = false; liveStateRef.current = "off"; setLiveState("off"); setMic("live is running in another window. Click Talk live to move it here."); return }
+    }
     if (rec.current) { rec.current.stop(); rec.current = null; setListening(false) }
     setLiveState("connecting"); setMic("live: connecting…")
     try {
@@ -533,11 +745,14 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       const { GoogleGenAI, Modality } = await import("@google/genai")
       const ai = new GoogleGenAI({ apiKey: tk.token, httpOptions: { apiVersion: "v1alpha" } })
       const out = new AudioContext({ sampleRate: 24000 })
+      // Started by the phone, not a click: Chrome may keep sound paused until this page gets one click or key press.
+      const unpause = () => { void out.resume().catch(() => {}); void micCtx?.resume().catch(() => {}) }
+      if (out.state !== "running") { void out.resume().catch(() => {}); window.addEventListener("pointerdown", unpause, { once: true }); window.addEventListener("keydown", unpause, { once: true }) }
       const playing = new Set<AudioBufferSourceNode>()
       const model: string = useFallback ? tk.fallbackModel : tk.model
       let playAt = 0, closed = false, newIn = true, newOut = true, turnIn = "", turnOut = ""
       let dropTurn = false // after a manual cut-in, the rest of what it was saying is thrown away
-      let heardAt = 0, toolAt = 0, chime: OscillatorNode | null = null // for timing a turn and the waiting sound
+      let saidSound = false, dg: WebSocket | null = null, dgNew = false, sendFrame = () => {}, voiceAt = 0, heardAt = 0, toolAt = 0, chime: OscillatorNode | null = null // for timing a turn and the waiting sound
       // A soft tone while a tool runs, so a pause never sounds like the assistant died. Stops at its first word.
       const chimeOff = () => { try { chime?.stop() } catch { /* already stopped */ } chime = null }
       const chimeOn = () => {
@@ -551,6 +766,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       }
       const hush = () => { playing.forEach((x) => { try { x.stop() } catch { /* already stopped */ } }); playing.clear(); playAt = 0 }
       const play = (b64: string) => {
+        if (out.state !== "running") void out.resume().catch(() => {}) // a paused output plays nothing and never ends
         const bin = atob(b64), n = bin.length >> 1
         if (!n) return
         const buf = out.createBuffer(1, n, 24000), ch = buf.getChannelData(0)
@@ -570,16 +786,17 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         if (remoteSink) { remoteSink.pause(); remoteSink.srcObject = null }
         micStream?.getTracks().forEach((x) => x.stop()); void micCtx?.close(); void out.close()
         try { session.close() } catch { /* already closed */ }
+        try { dg?.close() } catch { /* already closed */ }
         liveSession.current = null; liveOn.current = false; setLiveState("off"); setMic("off")
       }
       const session = await ai.live.connect({
         model,
-        // Voice settings that work well for a noisy room:
+        // Settings tuned for a long, noisy session:
         // low temperature, speech start not triggered by room noise, a turn ends after 0.6 s of silence, and a sliding
         // context window, without which a session with audio and video dies after about two minutes.
         config: {
           responseModalities: [Modality.AUDIO], systemInstruction: annotate ? LIVE_PROMPT + READING_PROMPT : LIVE_PROMPT, tools: [{ functionDeclarations: annotate ? [...LIVE_TOOLS, READING_TOOL] : LIVE_TOOLS }],
-          inputAudioTranscription: {}, outputAudioTranscription: {}, speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: tk.voice } } },
+          inputAudioTranscription: {}, outputAudioTranscription: {}, speechConfig: { languageCode: "en-US", voiceConfig: { prebuiltVoiceConfig: { voiceName: tk.voice } } },
           temperature: 0.3,
           realtimeInputConfig: { automaticActivityDetection: { startOfSpeechSensitivity: "START_SENSITIVITY_LOW" as never, endOfSpeechSensitivity: "END_SENSITIVITY_HIGH" as never, prefixPaddingMs: 40, silenceDurationMs: 380 } },
           contextWindowCompression: { triggerTokens: "16384", slidingWindow: { targetTokens: "8192" } },
@@ -589,14 +806,15 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
             const sc = m.serverContent
             if (sc?.interrupted) { hush(); chimeOff() }
             if (sc?.turnComplete || sc?.interrupted) dropTurn = false
-            if (sc?.inputTranscription?.text) { if (newIn) { turnIn = ""; newIn = false }; turnIn += sc.inputTranscription.text; heardAt = performance.now(); saidRef.current = turnIn.trim(); setSaid(turnIn.trim()) }
+            if (sc?.inputTranscription?.text) { if (newIn) { turnIn = ""; newIn = false }; turnIn += sc.inputTranscription.text; heardAt = performance.now(); if (!dg) { saidRef.current = turnIn.trim(); if (!demo) setSaid(turnIn.trim()) } } // the demo shows only the English (Deepgram) subtitles
             if (sc?.outputTranscription?.text) { if (newOut) { turnOut = ""; newOut = false }; turnOut += sc.outputTranscription.text; setReply(turnOut.trim()) }
             for (const part of sc?.modelTurn?.parts ?? []) if (part.inlineData?.data && !dropTurn) {
               chimeOff()
+              if (newOut || !saidSound) { saidSound = true; stageLog(`AI voice arriving, speaker: ${out.state}`) }
               if (heardAt) { const ms = Math.round(performance.now() - heardAt); console.log(`[vb] turn: ${ms} ms from last heard word to first sound${toolAt ? `, tool took ${toolAt} ms` : ""}`); setMic(`live · ${model} · answered in ${secs(ms)}`); heardAt = 0; toolAt = 0 }
               play(part.inlineData.data)
             }
-            if (sc?.turnComplete) { newIn = true; newOut = true }
+            if (sc?.turnComplete) { newIn = true; newOut = true; dgNew = true }
             const calls = m.toolCall?.functionCalls
             if (calls?.length) newOut = true // what it says after a tool call replaces what it said before
             if (calls?.length) void (async () => {
@@ -618,24 +836,75 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
           onclose: (e) => { if (!closed) { close(); if (!useFallback) { setMic(`live dropped${e.reason ? ` (${e.reason})` : ""}, reconnecting…`); void toggleLive(true) } else setMic(`live closed${e.reason ? `: ${e.reason}` : ""}`) } },
         },
       })
-      cutIn.current = () => { if (playing.size) { dropTurn = true; hush(); chimeOff() } }
+      // Subtitles: Deepgram, pinned to English, transcribes the same sound Gemini hears. Gemini's own transcript cannot be
+      // pinned to a language and sometimes shows Spanish or Japanese for accented English. Without a Deepgram key the
+      // page falls back to Gemini's transcript.
+      void fetch("/api/twin/stt-token").then((r) => r.json()).then((t) => {
+        if (!t.token || closed) return
+        const ws = new WebSocket("wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&smart_format=true&endpointing=300", ["bearer", t.token])
+        ws.binaryType = "arraybuffer"
+        let done = ""
+        ws.onopen = () => { dg = ws; console.log("[vb] subtitles: Deepgram (English)") }
+        ws.onmessage = (ev) => {
+          try {
+            const m = JSON.parse(String(ev.data))
+            const text: string = m.channel?.alternatives?.[0]?.transcript ?? ""
+            if (m.type !== "Results" || !text) return
+            if (dgNew) { done = ""; dgNew = false }
+            const shown = `${done} ${text}`.trim()
+            if (m.is_final) done = shown
+            saidRef.current = shown; setSaid(shown)
+          } catch { /* not a result */ }
+        }
+        ws.onclose = () => { if (dg === ws) dg = null }
+      }).catch(() => {})
+      cutIn.current = () => { if (playing.size) { dropTurn = true; hush(); chimeOff(); console.log("[vb] cut in: the rest of this answer is muted") } }
       liveOn.current = true
       liveSession.current = { close, text: (t) => { saidRef.current = t; setSaid(t); session.sendClientContent({ turns: [{ role: "user", parts: [{ text: t }] }], turnComplete: true }) } }
+      startingLive.current = false
+      // Check in with the server every 2 s. If another window has taken the assistant over, this one goes quiet.
+      void fetch("/api/twin/live-owner", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: tabId.current, force: true }) }).catch(() => {})
+      const owner = setInterval(() => {
+        if (closed) return clearInterval(owner)
+        void fetch(`/api/twin/live-owner?id=${tabId.current}`).then((r) => r.json()).then((o) => {
+          if (!o.mine && !closed) { close(); setMic("live moved to another window. Click Talk live to bring it back.") }
+        }).catch(() => {})
+      }, 2000)
+      const closeOnly = close
+      liveSession.current.close = () => { clearInterval(owner); void fetch(`/api/twin/live-owner?id=${tabId.current}`, { method: "DELETE" }).catch(() => {}); closeOnly() }
       // Eyes: one frame a second of whatever the left pane shows.
+      // Frames on demand (no video stream, the latest frame is read
+      // when it is needed). Every frame is about 258 tokens the model re-reads on each answer, so a steady stream made
+      // answers slower by the minute. Here: one fresh frame the moment the wearer starts talking, then one every 2 s while
+      // they keep talking (to catch a product being held up), and nothing while nobody speaks.
+      let tick = 0
+      sendFrame = () => { const f = frame(768); if (f && !closed) session.sendRealtimeInput({ video: { data: f.split(",")[1], mimeType: "image/jpeg" } }) }
       frames = setInterval(() => {
-        const f = frame(768)
-        if (f && !closed) session.sendRealtimeInput({ video: { data: f.split(",")[1], mimeType: "image/jpeg" } })
+        tick++
+        if (Date.now() - voiceAt < 1500 && tick % 2 === 0) sendFrame()
         // Once a second: is sound really arriving from the mic? "silent" for long means the mic path is broken.
-        if (micStream) { setMicLevel(micPeak === -2 ? "hold Space and talk" : micPeak < 0 ? "not listening while I talk" : micPeak >= 1 ? "hearing you" : micPeak > 0 ? "room noise only, speak up or closer" : "silent"); micPeak = 0 }
+        // Sound that was queued but never played keeps the echo gate shut ("not listening while I talk") forever. If the
+        // queue is stuck for more than 4 s past its end, drop it so the mic opens again, and say what the speaker is doing.
+        if (playing.size && out.currentTime > playAt + 4) { playing.clear(); playAt = 0 }
+        if (out.state !== "running" || micCtx?.state === "suspended") setMicLevel(`speaker ${out.state}: click this page once so Bearly can talk and listen`)
+        else if (micStream) { setMicLevel(micPeak === -2 ? "hold Space and talk" : micPeak < 0 ? `not listening while I talk (${Math.max(0, playAt - out.currentTime).toFixed(1)} s of voice left)` : micPeak >= 1 ? "hearing you" : micPeak > 0 ? "room noise only, speak up or closer" : "silent"); micPeak = 0 }
       }, 1000)
-      // Ears: the microphone as 16 kHz PCM, sent as it is spoken.
+      // Ears: the microphone as 16 kHz PCM, sent as it is spoken. The glasses microphone when the picture is the glasses
+      // (it sits next to the mouth, so it beats a laptop mic in a loud room), otherwise this computer's.
+      // Runs again whenever the glasses mic arrives or the picture source changes, without restarting the conversation.
+      const useMic = async () => {
+        if (closed) return
+        if (remoteSink) { remoteSink.pause(); remoteSink.srcObject = null; remoteSink = null }
+        micStream?.getTracks().forEach((x) => x.stop()); void micCtx?.close(); micStream = null; micCtx = null
       try {
-        micStream = glasses.current?.audio && (!demo || prefer.current === "glasses")
+        micStream = bandStream.current
+          ? new MediaStream([bandStream.current.getAudioTracks()[0].clone()]) // a copy: stopping it here must not stop the band
+          : glasses.current?.audio && (!demo || prefer.current === "glasses")
           ? new MediaStream([glasses.current.audio.clone()])
           : await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false }, video: false }) // no auto gain: it pumps the room noise up between words
         // Chrome only lets a remote (WebRTC) audio track flow into Web Audio once it also plays in a media element.
         // Without this the glasses mic arrives as pure silence and the assistant never hears anything. Muted, so no echo.
-        if (glasses.current?.audio && (!demo || prefer.current === "glasses")) {
+        if (!bandStream.current && glasses.current?.audio && (!demo || prefer.current === "glasses")) {
           const sink = new Audio()
           sink.srcObject = micStream; sink.muted = true
           void sink.play().catch(() => {})
@@ -652,6 +921,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
           let bin = ""
           for (let i = 0; i < u.length; i++) bin += String.fromCharCode(u[i])
           session.sendRealtimeInput({ audio: { data: btoa(bin), mimeType: "audio/pcm;rate=16000" } })
+          if (dg?.readyState === WebSocket.OPEN) dg.send(u.buffer) // the same sound, for the English subtitles
         }
         let floor = 0.01, openFor = 0, prev: Float32Array | null = null
         proc.onaudioprocess = (e) => {
@@ -668,24 +938,36 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
           // the model clean gaps to answer in. The room level is tracked slowly, and only while nobody is talking to us.
           const loud = level > Math.max(0.012, floor * 2.6)
           if (!loud) floor = floor * 0.97 + level * 0.03
+          // Steady sound that never drops (the band mic in a busy room) also becomes the room level, over about 6 s.
+          // Before, the room level could only learn from quiet moments, so a constant hum kept the gate open forever:
+          // the model heard one endless sentence and never answered.
+          else floor = floor * 0.98 + level * 0.02
           if (loud) openFor = 4 // keep sending for about half a second after the voice drops, so word endings are not cut
           else if (openFor > 0) openFor--
           const talking = pttRef.current ? held.current : openFor > 0 && !echo
           if (talking && loud && openFor === 4 && prev && micPeak >= 0) sendPcm(prev, prev.length) // the buffer just before, so the first sound is not clipped
+          if (talking) { if (Date.now() - voiceAt > 2500) sendFrame(); voiceAt = Date.now() } // a new sentence: show what is in front of them now
           sendPcm(talking ? f : null, f.length)
           prev = talking ? null : new Float32Array(f)
           if (pttRef.current) micPeak = held.current ? 1 : -2; else if (echo) micPeak = -1; else if (talking) micPeak = Math.max(micPeak, 1); else if (micPeak < 1) micPeak = Math.max(micPeak, level > 0.004 ? 0.5 : 0)
         }
         micCtx.createMediaStreamSource(micStream).connect(proc); proc.connect(mute); mute.connect(micCtx.destination)
-        setMic(`live · ${micStream.getAudioTracks()[0]?.label || "microphone"} · ${model}`)
+        setMic(`live · ${bandStream.current ? "band 67 mic" : remoteSink ? "glasses mic" : micStream.getAudioTracks()[0]?.label || "microphone"} · ${model}`)
+        stageLog(`AI is listening to: ${bandStream.current ? "band 67" : remoteSink ? "phone mic (via LiveKit)" : `this Mac's mic (${micStream.getAudioTracks()[0]?.label || "default"})`}`)
       } catch { setMic("live is on, but the microphone is blocked. Type instead.") }
+      }
+      await useMic()
+      remic.current = () => { void useMic() }
       setLiveState("on")
     } catch (e) {
-      liveSession.current = null; liveOn.current = false; setLiveState("off")
+      liveSession.current = null; liveOn.current = false; setLiveState("off"); startingLive.current = false
       if (!useFallback) { setMic("live could not start, trying the fallback model…"); void toggleLive(true); return }
       setMic(`live error: ${e instanceof Error ? e.message : "could not start"}`)
     }
   }
+  useEffect(() => { liveStateRef.current = liveState }, [liveState])
+  useEffect(() => { toggleLiveRef.current = (force?: boolean) => toggleLive(false, !!force) })
+
   /** Something the wearer said by typing or pressing a button: to the live session when it is on, else to the page's own handler. */
   const send = (t: string) => { if (!t.trim()) return; if (liveSession.current) { setText(""); liveSession.current.text(t.trim()) } else void handle(t) }
 
@@ -701,9 +983,17 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
   const macStream = useRef<MediaStream | null>(null)
   const prefer = useRef<"glasses" | "mac">("glasses")
   const [preferUi, setPreferUi] = useState<"glasses" | "mac">("glasses")
+  const [phoneOn, setPhoneOn] = useState(false)
+  const [bandFirstTime, setBandFirstTime] = useState(false)
+  const stageOn = useRef(false) // the demo shows no picture until the phone presses Start (or the Mac camera is picked by hand)
   const applySource = async () => {
     const v = video.current
     if (!v) return
+    if (demo && !stageOn.current && prefer.current !== "mac") {
+      macStream.current?.getTracks().forEach((t) => t.stop()); macStream.current = null
+      v.srcObject = null; setCamera(false); setSource("walk")
+      return
+    }
     if (prefer.current === "glasses" && glassesVideo.current) {
       macStream.current?.getTracks().forEach((t) => t.stop()); macStream.current = null
       v.removeAttribute("src"); v.srcObject = new MediaStream([glassesVideo.current]); setCamera(true); setSource("glasses"); setSeenLog([]); void v.play()
@@ -715,12 +1005,27 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       v.removeAttribute("src"); v.srcObject = macStream.current; setCamera(true); setSource("camera"); void v.play()
     } catch { setReply("I could not open this computer's camera. Allow it in the browser, or start the glasses.") }
   }
-  const choose = (which: "glasses" | "mac") => { prefer.current = which; setPreferUi(which); void applySource() }
+  const choose = (which: "glasses" | "mac") => { prefer.current = which; setPreferUi(which); void applySource(); remic.current() }
+  // Own effect: the demo's start-up effect runs once only, and React's double mount in development removed these listeners.
+  useEffect(() => {
+    const touch = () => { touched.current = true; setClicked(true) }
+    window.addEventListener("pointerdown", touch); window.addEventListener("keydown", touch)
+    return () => { window.removeEventListener("pointerdown", touch); window.removeEventListener("keydown", touch) }
+  }, [])
   const demoStarted = useRef(false)
   useEffect(() => {
     if (!demo || demoStarted.current) return
     demoStarted.current = true
-    void applySource(); void toggleGlasses()
+    void toggleGlasses() // joins the room and waits for the phone. No camera, band or assistant until Start
+    // The assistant is on from the start in the demo. Browsers only let sound play after a click or a key press,
+    // so the session also (re)starts on the first one, and whenever it is found off.
+    // Opening the page starts nothing. The phone's Start begins the session (band mic, assistant, glasses camera);
+    // a click here only marks that a person is at this window, which lets Chrome play the assistant's voice later.
+    const touch = () => { touched.current = true; setClicked(true) }
+    // Ask only when Chrome really blocks sound: a test audio player that starts "running" means sound is already allowed.
+    try { const test = new AudioContext(); if (test.state === "running" || navigator.userActivation?.hasBeenActive) setClicked(true); void test.close() } catch { setClicked(true) }
+    window.addEventListener("pointerdown", touch); window.addEventListener("keydown", touch)
+    return () => { window.removeEventListener("pointerdown", touch); window.removeEventListener("keydown", touch) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [demo])
 
@@ -746,14 +1051,44 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       }
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind === Track.Kind.Video) (track as unknown as { setPlayoutDelay?: (s: number) => void }).setPlayoutDelay?.(0)
-        if (track.kind === Track.Kind.Video && demo) { glassesVideo.current = track.mediaStreamTrack; void applySource(); setMic(`glasses video on · room ${tk.room}`) }
+        if (track.kind === Track.Kind.Video && demo) { glassesVideo.current = track.mediaStreamTrack; void applySource(); setMic(`glasses video on · room ${tk.room}`); if (!liveSession.current && liveStateRef.current === "off") { liveStateRef.current = "connecting"; void toggleLiveRef.current() } }
         else if (track.kind === Track.Kind.Video) { v.removeAttribute("src"); v.srcObject = new MediaStream([track.mediaStreamTrack]); setCamera(true); setSource("glasses"); setSeenLog([]); void v.play(); setMic(`glasses video on · room ${tk.room}`) }
-        if (track.kind === Track.Kind.Audio && glasses.current) { glasses.current.audio = track.mediaStreamTrack; setMic(`glasses video and mic on · room ${tk.room}. Start Talk live again to use the glasses mic.`) }
+        if (track.kind === Track.Kind.Audio && glasses.current) { glasses.current.audio = track.mediaStreamTrack; setMic(`glasses video and mic on · room ${tk.room}`); remic.current() }
       })
-      room.on(RoomEvent.DataReceived, (payload) => {
+      room.on(RoomEvent.DataReceived, (payload, _p, _k, topic) => {
+        // The band's sound, relayed by the phone (the band is on the iPhone's Bluetooth): 2 bytes seq, then one Opus packet.
+        if (topic === "band-audio") { void phoneBandAudio(payload); return }
         try {
           const m = JSON.parse(new TextDecoder().decode(payload))
-          if (m.type === "pose") {
+          if (m.type === "band") { bandTapRef.current(m.kind === "double-tap" ? "double-tap" : "tap"); return }
+          if (m.type === "band-status") { stageLog(`band on the phone: ${m.state}${m.note ? ` (${m.note})` : ""}`); if (m.state !== "connected") dropPhoneBand(); return }
+          if (m.type === "ptt") {
+            setPtt(true); pttRef.current = true; held.current = !!m.down
+            if (m.down) { cutIn.current(); if (!liveSession.current && liveStateRef.current === "off") { liveStateRef.current = "connecting"; void toggleLiveRef.current() } }
+          }
+          // The phone's Start and Stop drive the whole stage: band mic (Mac Bluetooth) and the live assistant.
+          else if (m.type === "start") {
+            // The band is on the Mac's Bluetooth and Chrome remembers it: keep trying quietly for a minute, so a double tap
+            // on the band (which wakes it) is all it takes. No button, no chooser.
+            if (!bandRef.current && !bandLoop.current) {
+              bandLoop.current = true
+              void (async () => {
+                for (let i = 0; i < 20 && stageOn.current && !bandRef.current; i++) {
+                  await toggleBandRef.current(true)
+                  if (bandRef.current || bandNeverPicked.current) break
+                  await sleep(1000)
+                }
+                bandLoop.current = false
+              })()
+            }
+            setPhoneOn(true)
+            void fetch("/api/twin/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: "stage", text: "Start received from the phone" }) }).catch(() => {})
+            if (!stageOn.current) { stageOn.current = true; void applySource() } // the Mac camera fills in until the glasses send
+            if (!liveSession.current && liveStateRef.current === "off") { liveStateRef.current = "connecting"; void toggleLiveRef.current() }
+          }
+          else if (m.type === "stop") { setPhoneOn(false); dropPhoneBand(); stageOn.current = false; prefer.current = "glasses"; setPreferUi("glasses"); void applySource(); liveSession.current?.close(); setMic("the phone pressed Stop, so Bearly stopped listening") }
+          else if (m.type === "pttmode") { setPtt(!!m.on); pttRef.current = !!m.on; held.current = false }
+          else if (m.type === "pose") {
             sensed = true
             if (m.reset) k.path = [[0, 0]]
             k.pos = [Number(m.x) || 0, Number(m.z) || 0]; k.heading = Number(m.heading) || 0; k.steps = Number(m.steps) || 0
@@ -764,8 +1099,8 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
       })
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (!demo) return
-        if (track.kind === Track.Kind.Video) { glassesVideo.current = null; void applySource(); setMic("the glasses stopped sending video, showing this computer's camera") }
-        if (track.kind === Track.Kind.Audio && glasses.current) glasses.current.audio = null
+        if (track.kind === Track.Kind.Video) { glassesVideo.current = null; void applySource(); setMic("the glasses dropped the video; Bearly keeps listening, the Mac camera fills in") } // only the phone's Stop ends the assistant
+        if (track.kind === Track.Kind.Audio && glasses.current) { glasses.current.audio = null; remic.current() }
       })
       // In the demo the page stays in the room: if the connection drops it comes back by itself.
       room.on(RoomEvent.Disconnected, () => { if (glasses.current) { leave(); if (demo) setTimeout(() => { if (!glasses.current) void toggleGlasses() }, 3000) } })
@@ -829,6 +1164,55 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
     </div>
   )
 
+  const quoteAsk = asks.find((a) => a.quote)
+  const QuoteDoc = ({ big }: { big?: boolean }) => {
+    const q = quoteAsk?.quote
+    if (!q) return null
+    const { margin, total } = quoteTotals(q)
+    const line = (label: string, value: string, note?: string) => (
+      <div className="flex justify-between gap-3"><span>{label}{note && <span className="text-[#8C8C88]"> · {note}</span>}</span><span className="whitespace-nowrap tabular-nums">{value}</span></div>
+    )
+    return (
+      <div className={`flex flex-col bg-[#F4F4F2] text-[#0B0B0C] ${big ? "gap-3 rounded-xl p-8 text-sm" : "h-[128px] gap-1 overflow-hidden rounded-md p-2.5 text-[6px] leading-[8px]"}`}>
+        <div className="flex items-baseline justify-between"><b className={big ? "text-2xl tracking-[0.06em]" : "text-[9px] tracking-[0.08em]"}>QUOTE</b><span className="text-[#55554F]">{q.at}</span></div>
+        <p className="text-[#55554F]">Quote for customer · test mode, sample customer</p>
+        <div className={`flex justify-between bg-[#0B0B0C] font-bold tracking-[0.06em] text-[#F4F4F2] ${big ? "px-3 py-2 text-xs" : "px-1 py-[3px] text-[5px]"}`}><span>ITEM</span><span>AMOUNT</span></div>
+        <div className="flex flex-col">
+          {line(q.item, usd(q.partCents))}
+          {big && <span className="text-[#55554F]">{q.read ? `Read on the part: ${q.read} · ` : ""}{q.seller}, online store price</span>}
+        </div>
+        {line(`Margin ${q.marginPct}%`, usd(margin), q.marginSaid ? undefined : "default")}
+        {line("Labor", usd(q.laborCents), q.laborSaid ? undefined : "default")}
+        <div className="h-px bg-[#C9C9C5]" />
+        <div className={`flex justify-between font-bold ${big ? "text-lg" : "text-[7px]"}`}><span>Quote total</span><span className="tabular-nums">{usd(total)}</span></div>
+        <p className="text-[#8C8C88]">Part price is the seller&apos;s online store price on Shopify. Test mode: no real customer, nothing ordered until approved.</p>
+      </div>
+    )
+  }
+  // A document shown large in the right panel, in place of the list (no pop-up in the middle of the screen).
+  const DocPane = () => (
+    <div data-doc={zoom} className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {(["quote", "invoice", "report"] as const).filter((d) => d === "report" || (d === "invoice" ? paidAsks.length > 0 : !!quoteAsk)).map((d) => (
+          <button key={d} onClick={() => setZoom(d)} className={`${chip} ${zoom === d ? "!border-[#F4F4F2] !text-[#F4F4F2]" : ""}`}>{d === "quote" ? "Quote.pdf" : d === "invoice" ? "Invoice.pdf" : "Walk report.pdf"}</button>
+        ))}
+        <span className="flex-1" />
+        <button onClick={() => setZoom(null)} className={chip}>Back to the list</button>
+      </div>
+      {zoom === "quote" ? QuoteDoc({ big: true }) : zoom === "invoice" ? Invoice({ big: true }) : Report({ big: true })}
+      {zoom === "quote" && (
+        <div className="flex items-center gap-3">
+          {sent.quote ? <b className="text-sm text-[#F4F4F2]">✓ Quote emailed · {sent.quote} · check your inbox</b> : <><p className="flex-1 text-xs text-[#8C8C88]">Email to the customer · ready to send</p><button onClick={() => void sendEmail("quote")} className="whitespace-nowrap rounded-full bg-[#F4F4F2] px-3.5 py-2 text-sm font-semibold text-[#0B0B0C]">“send it”</button></>}
+        </div>
+      )}
+      {zoom !== "quote" && asks.some((a) => a.kind === "email" && a.status === "ready") && (
+        <div className="flex items-center gap-3">
+          {sent.manager ? <b className="text-sm text-[#F4F4F2]">✓ Emailed · {sent.manager} · check your inbox</b> : <><p className="flex-1 text-xs text-[#8C8C88]">Email to your manager with Invoice.pdf and Walk report.pdf · ready to send</p><button onClick={() => void sendEmail("manager")} className="whitespace-nowrap rounded-full bg-[#F4F4F2] px-3.5 py-2 text-sm font-semibold text-[#0B0B0C]">“send it”</button></>}
+        </div>
+      )}
+    </div>
+  )
+
   const here = row?.zone ?? null
   useEffect(() => {
     if (!spatial) return
@@ -849,12 +1233,33 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
     <main className="vb flex min-h-dvh flex-col gap-4 bg-[#0B0B0C] p-4 font-sans text-[#F4F4F2] lg:h-dvh lg:p-6">
       <style>{`.vb .vb-in{animation:vbin .35s ease-out both}@keyframes vbin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}`}</style>
       <header className="flex flex-wrap items-end justify-between gap-3">
+        {demo ? (
+          <div className="flex items-center gap-3">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/bearly-mark.png" alt="" className="h-12 w-auto" />
+            <div>
+              <p className="text-[15px] font-bold leading-none">Bearly</p>
+              <h1 className="mt-1 text-3xl font-black leading-tight tracking-tight">See it. Say it. Bought.</h1>
+            </div>
+          </div>
+        ) : (
         <div>
-          <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[#B9B9B5]">Bearly · {demo ? "Live" : "Live walk"} · Stripe test mode</p>
+          <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[#B9B9B5]">Bearly · Live walk · Stripe test mode</p>
           <h1 className="text-3xl font-black leading-tight tracking-tight">See it. Say it. Bought.</h1>
         </div>
+        )}
         <div className="flex items-center gap-2 text-xs">
+          {demo && (
+            // What the phone's Start turned on. A filled dot is on, an empty one is not yet.
+            <span className="mr-2 flex items-center gap-3 text-[#B9B9B5]">
+              {([["Phone", phoneOn], ["Band", bandUi === "on"], ["AI", liveState === "on"], ["Glasses", source === "glasses"]] as const).map(([name, on]) => (
+                <span key={name} className="flex items-center gap-1.5"><i className={`h-2 w-2 rounded-full ${on ? "bg-[#F4F4F2]" : "border border-[#55555A]"}`} />{name}</span>
+              ))}
+            </span>
+          )}
+          {demo && phoneOn && bandUi === "off" && bandFirstTime && <button onClick={() => void toggleBand()} className={`${chip} !border-[#F4F4F2] !text-[#F4F4F2]`}>Connect band</button>}
           <button onClick={() => setZoom("board")} className={chip}>Board</button>
+          {demo && spatial && <button onClick={() => setMapOpen(true)} className={chip}>Map</button>}
           {demo ? (
             <>
               <button onClick={() => choose("glasses")} className={`${chip} ${source === "glasses" ? "!border-[#F4F4F2] !text-[#F4F4F2]" : ""}`}>{source === "glasses" ? "Glasses · live" : preferUi === "glasses" ? "Glasses · waiting" : "Glasses"}</button>
@@ -867,7 +1272,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
               <button onClick={toggleCamera} disabled={source === "glasses"} className={`${chip} disabled:opacity-40`}>{source === "camera" ? "Use the recorded walk" : "Use this camera"}</button>
             </>
           )}
-          <span className="flex items-center gap-2 text-[#D3D3D1]"><i className="h-2 w-2 rounded-full bg-[#FF4D3D]" />{source === "glasses" ? "Glasses" : source === "camera" ? (demo ? "Mac camera" : "Camera") : demo ? "Starting" : "Recorded walk"} · {clock(now)}</span>
+          <span className="flex items-center gap-2 text-[#D3D3D1]"><i className="h-2 w-2 rounded-full bg-[#FF4D3D]" />{source === "glasses" ? "Glasses" : source === "camera" ? (demo ? "Mac camera" : "Camera") : demo ? "Waiting for Start" : "Recorded walk"} · {clock(now)}</span>
         </div>
       </header>
 
@@ -875,6 +1280,12 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         {/* Left: what the glasses see */}
         <div className="relative aspect-[3/4] w-full shrink-0 overflow-hidden rounded-2xl bg-black lg:h-full lg:w-auto">
           <video ref={video} src={demo ? undefined : "/twin-local/pov.mp4"} autoPlay muted loop playsInline onClick={() => cutIn.current()} className="h-full w-full object-cover" />
+          {demo && !camera && <p className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-[#77777A]">Press Start on the phone</p>}
+          {demo && !clicked && (
+            // Without one click Chrome keeps the page's microphone and speaker paused, so the assistant hears nothing,
+            // says nothing and no subtitles appear. This stays until that click.
+            <button onClick={() => { touched.current = true; setClicked(true) }} className="absolute inset-x-6 top-16 rounded-2xl bg-[#F4F4F2] px-5 py-4 text-left text-[#0B0B0C]"><b className="block text-base">Click here once to turn on sound</b><span className="text-sm text-[#55554F]">Chrome needs one click before Bearly can hear and talk.</span></button>
+          )}
           {seeing.map((o) => (
             <span key={o.label} className="pointer-events-none absolute border-[1.5px] border-[#F4F4F2] transition-all duration-200 ease-linear"
               style={{ top: `${o.box[0] / 10}%`, left: `${o.box[1] / 10}%`, height: `${(o.box[2] - o.box[0]) / 10}%`, width: `${(o.box[3] - o.box[1]) / 10}%` }}>
@@ -883,15 +1294,22 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
           ))}
           <p className="absolute left-3 top-3 rounded-full border border-white/15 bg-black/60 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.12em] backdrop-blur-md">Glasses POV · Live</p>
           <div className="absolute inset-x-3 bottom-3 flex flex-col gap-1.5">
-            {(hearing || lastSaid) && <p className="w-fit max-w-[88%] rounded-2xl border border-white/15 bg-black/65 px-3.5 py-2.5 backdrop-blur-md"><b className="mr-2 text-[11px] tracking-[0.1em] text-[#B9B9B5]">YOU</b>{lastSaid || <span className="text-[#B9B9B5]">listening…</span>}</p>}
+            {(hearing || lastSaid) && <p className="w-fit max-w-[88%] rounded-2xl border border-white/15 bg-black/65 px-3.5 py-2.5 backdrop-blur-md"><b className="mr-2 text-[11px] tracking-[0.1em] text-[#B9B9B5]">JK</b>{lastSaid || <span className="text-[#B9B9B5]">listening…</span>}</p>}
             {reply && <p data-reply className="w-fit max-w-[88%] self-end rounded-2xl bg-[#F4F4F2] px-3.5 py-2.5 font-medium text-[#0B0B0C]"><b className="mr-2 text-[11px] tracking-[0.1em] text-[#55554F]">BEARLY</b>{reply}</p>}
           </div>
         </div>
 
         {/* Middle: seen stream */}
-        <div className={`flex w-full shrink-0 flex-col gap-3 ${spatial ? "lg:w-[400px]" : "lg:w-[236px]"}`}>
-        {spatial && (
-          <div data-room className="relative h-[300px] shrink-0 overflow-hidden rounded-2xl border border-[#2A2A2E] lg:h-[46%]">
+        <div className={`flex w-full shrink-0 flex-col gap-3 ${spatial && !demo ? "lg:w-[400px]" : demo ? "lg:w-[300px]" : "lg:w-[236px]"}`}>
+        {spatial && (!demo || mapOpen) && (
+        <div data-map className={demo ? "fixed inset-0 z-50 flex flex-col gap-3 bg-[#0B0B0C]/95 p-6 backdrop-blur-md lg:p-10" : "contents"}>
+          {demo && (
+            <div className="flex items-end justify-between">
+              <div><p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[#B9B9B5]">Bearly · Where you walked</p><h2 className="text-3xl font-black tracking-tight">The map</h2></div>
+              <button onClick={() => setMapOpen(false)} className={chip}>Close</button>
+            </div>
+          )}
+          <div data-room className={demo ? "relative min-h-0 flex-1 overflow-hidden rounded-2xl border border-[#2A2A2E]" : "relative h-[300px] shrink-0 overflow-hidden rounded-2xl border border-[#2A2A2E] lg:h-[46%]"}>
             <PinRoom pins={pins} here={camera ? null : here} trail={camera ? [] : trail} recon={camera ? null : recon} time={now} track={livePos ?? (demo ? IDLE_TRACK : null)} space={camera ? space : null} cal={cal} />
             {camera && space && (
               <div className="absolute bottom-2 right-2 flex gap-1 text-xs">
@@ -903,8 +1321,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
             <p className="pointer-events-none absolute left-3 top-3 text-[11px] font-bold uppercase tracking-[0.14em] text-[#8C8C88]">{livePos ? `Live · where you are` : camera && space ? "This room · rebuilt from a phone video" : camera ? "Captured, in order" : recon ? "Where · rebuilt from the glasses video" : "Where · schematic, not measured"}</p>
             <p className="pointer-events-none absolute bottom-3 left-3 text-xs text-[#8C8C88]">{pins.length} pinned</p>
           </div>
-        )}
-        {spatial && livePos && (() => {
+        {livePos && (() => {
           // Steps and body direction come from the phone in the pocket, head turn from the glasses. Distance is the length of the drawn path.
           const walked = livePos.path.reduce((sum, pt, n) => (n ? sum + Math.hypot(pt[0] - livePos.path[n - 1][0], pt[1] - livePos.path[n - 1][1]) : 0), 0)
           const deg = (r: number) => Math.round((((r * 180) / Math.PI) % 360 + 360) % 360)
@@ -917,6 +1334,8 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
             </div>
           )
         })()}
+        </div>
+        )}
         <div className="flex max-h-60 min-h-0 w-full flex-1 flex-col rounded-2xl border border-[#2A2A2E] p-4 lg:max-h-none">
           <div className="flex items-baseline justify-between pb-2.5"><b className="text-[11px] uppercase tracking-[0.14em] text-[#8C8C88]">Seen · Jev, live</b><span className="text-xs text-[#8C8C88]">{seenLog.length}</span></div>
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -938,6 +1357,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
         <div className="flex min-h-[420px] min-w-0 flex-1 flex-col gap-3">
           <div className="flex items-baseline justify-between"><b className="text-[11px] uppercase tracking-[0.14em] text-[#8C8C88]">You asked · {asks.length}</b><span className="text-xs tabular-nums text-[#D3D3D1]">Bought so far {usd(total)}</span></div>
           <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
+            {zoom && zoom !== "board" ? DocPane() : <>
             {asks.length === 0 && <p className="rounded-2xl border border-dashed border-[#2A2A2E] p-8 text-center text-sm text-[#77777A]">Look at something and say what you want. Try “Find me the cheapest one of these”.</p>}
             {asks.map((a, i) => {
               const offer = a.offers[a.pick]
@@ -975,7 +1395,7 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
                       <div className="flex items-center gap-4">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         {offer.image && <img src={offer.image} alt="" className="h-20 w-20 shrink-0 rounded-lg bg-white object-contain" />}
-                        <div className="min-w-0 flex-1"><p className="line-clamp-2 text-[17px] font-semibold leading-[23px]">{offer.title}</p><p className="text-[13px] text-[#8C8C88]">{offer.seller}</p></div>
+                        <div className="min-w-0 flex-1"><p className="line-clamp-2 text-[17px] font-semibold leading-[23px]">{offer.title}</p><p className="text-[13px] text-[#8C8C88]">{offer.seller}{offer.url && <> · <a href={offer.url} target="_blank" rel="noreferrer" className="underline hover:text-[#F4F4F2]">View on the store ↗</a></>}</p></div>
                         <b data-price className="whitespace-nowrap text-[34px] tracking-tight text-[#FFD100]">{usd(offer.priceCents)}</b>
                       </div>
                       <div className="flex gap-2 overflow-x-auto">
@@ -991,6 +1411,18 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
                         <button onClick={() => send("Buy it")} disabled={a.status !== "ready"} className="whitespace-nowrap rounded-full bg-[#F4F4F2] px-3.5 py-2 text-sm font-semibold text-[#0B0B0C] disabled:opacity-40">“buy it”</button>
                         <button onClick={() => send("Skip")} className={chip}>“skip”</button>
                         <button onClick={() => send("Show me the next one")} className={chip}>“next”</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {a.kind === "quote" && a.quote && (
+                    <div className="vb-in flex flex-col gap-3 rounded-xl bg-[#1C1C1F] p-[18px]">
+                      <b className="text-[11px] uppercase tracking-[0.14em] text-[#B9B9B5]">For the customer · ready to send</b>
+                      <p className="text-[17px] font-semibold leading-[23px]">Quote · {usd(quoteTotals(a.quote).total)}</p>
+                      <button onClick={() => setZoom("quote")} className="w-[190px] text-left"><QuoteDoc /><p className="mt-2 text-[13px] font-semibold">Quote.pdf</p></button>
+                      <div className="flex flex-wrap gap-2">
+                        <button onClick={() => send("Yup, order the part")} className="whitespace-nowrap rounded-full bg-[#F4F4F2] px-3.5 py-2 text-sm font-semibold text-[#0B0B0C]">“yup”</button>
+                        <button onClick={() => setZoom("quote")} className={chip}>“show quote”</button>
                       </div>
                     </div>
                   )}
@@ -1012,15 +1444,20 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
                 </article>
               )
             })}
+            </>}
           </div>
 
           <form onSubmit={(e) => { e.preventDefault(); send(text) }} className="flex flex-col gap-2">
             <div className="flex gap-2 overflow-x-auto">{QUICK.map((q) => <button type="button" key={q} onClick={() => send(q)} className={`${chip} !py-1.5 !text-xs`}>{q}</button>)}</div>
             <div className="flex gap-2">
-              <button type="button" onClick={() => void toggleLive()} className={`whitespace-nowrap rounded-full px-4 py-2.5 text-sm font-semibold ${liveState === "on" ? "bg-[#F4F4F2] text-[#0B0B0C]" : "border border-[#3A3A3F]"}`}>{liveState === "on" ? "Live · on" : liveState === "connecting" ? "Connecting…" : "Talk live"}</button>
+              {demo ? <span className={`whitespace-nowrap rounded-full px-4 py-2.5 text-sm font-semibold ${liveState === "on" ? "bg-[#F4F4F2] text-[#0B0B0C]" : "border border-[#3A3A3F] text-[#8C8C88]"}`}>{liveState === "on" ? "Live · on" : liveState === "connecting" ? "Connecting…" : "Press Start on the phone"}</span> :
+              <button type="button" onClick={() => { if (demo && !bandRef.current) void toggleBand(); void toggleLive(false, true) }} className={`whitespace-nowrap rounded-full px-4 py-2.5 text-sm font-semibold ${liveState === "on" ? "bg-[#F4F4F2] text-[#0B0B0C]" : "border border-[#3A3A3F]"}`}>{liveState === "on" ? "Live · on" : liveState === "connecting" ? "Connecting…" : "Talk live"}</button>}
+              {/* The demo keeps one voice button. Hold-to-talk lives in the phone app; the older mic path is for the test pages. */}
+              {!demo && (<>
               <button type="button" onClick={() => setPtt((x) => !x)} onPointerDown={() => { if (ptt) { cutIn.current(); held.current = true } }} onPointerUp={() => { held.current = false }} onPointerLeave={() => { held.current = false }}
                 title="For loud rooms: the assistant only listens while Space is held" className={`whitespace-nowrap rounded-full px-4 py-2.5 text-sm font-semibold ${ptt ? "bg-[#F4F4F2] text-[#0B0B0C]" : "border border-[#3A3A3F]"}`}>{ptt ? "Hold Space to talk · on" : "Hold to talk"}</button>
               <button type="button" onClick={toggleMic} disabled={liveState !== "off"} className={`whitespace-nowrap rounded-full px-4 py-2.5 text-sm font-semibold ${listening ? "bg-[#F4F4F2] text-[#0B0B0C]" : "border border-[#3A3A3F]"}`}>{listening ? "Listening…" : "Mic (old)"}</button>
+              </>)}
               <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type what you would say" className="min-w-0 flex-1 rounded-full border border-[#3A3A3F] bg-transparent px-4 py-2.5 text-sm outline-none placeholder:text-[#55555A]" />
               <button type="submit" className="whitespace-nowrap rounded-full border border-[#3A3A3F] px-4 py-2.5 text-sm">Say</button>
             </div>
@@ -1131,14 +1568,6 @@ export default function ReportApp({ annotate = false, spatial = false, demo = fa
               ))
             })()}
             {seenLog.length === 0 && <p className="col-span-full text-sm text-[#77777A]">Nothing seen yet.</p>}
-          </div>
-        </div>
-      )}
-      {zoom && zoom !== "board" && (
-        <div data-zoom={zoom} onClick={() => setZoom(null)} className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm">
-          <div onClick={(e) => e.stopPropagation()} className="max-h-full w-full max-w-2xl overflow-y-auto">
-            {zoom === "invoice" ? <Invoice big /> : <Report big />}
-            <button onClick={() => setZoom(null)} className={`${chip} mt-3`}>Close</button>
           </div>
         </div>
       )}
